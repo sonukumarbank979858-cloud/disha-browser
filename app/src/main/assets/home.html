@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="hi"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>दिशा होम</title>
+<style>
+:root{--brand:#FF6D28;--bg:#fff7f0;--card:#ffffff;--text:#1f2937;--muted:#6b7280}
+@media (prefers-color-scheme:dark){:root{--bg:#121212;--card:#1e1e1e;--text:#f3f4f6;--muted:#9ca3af}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:640px;margin:auto;padding:28px 18px}
+.logo{text-align:center;margin-top:24px}
+.logo h1{font-size:42px;margin:0;letter-spacing:1px}
+.logo h1 span{color:var(--brand)}
+.logo p{color:var(--muted);margin:6px 0 0}
+.clock{text-align:center;color:var(--muted);margin:12px 0 22px;font-size:14px}
+form{display:flex;background:var(--card);border-radius:30px;box-shadow:0 2px 10px rgba(0,0,0,.12);overflow:hidden}
+input{flex:1;border:0;padding:16px 20px;font-size:17px;background:transparent;color:var(--text);outline:none}
+button{border:0;background:var(--brand);color:#fff;font-size:16px;padding:0 22px}
+.chips{display:flex;gap:8px;justify-content:center;margin:14px 0 26px;flex-wrap:wrap}
+.chip{padding:7px 14px;border-radius:18px;background:var(--card);color:var(--text);font-size:14px;border:1px solid rgba(128,128,128,.25)}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.tile{display:flex;flex-direction:column;align-items:center;text-decoration:none;color:var(--text);font-size:13px}
+.ic{width:52px;height:52px;border-radius:50%;background:var(--card);display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 1px 6px rgba(0,0,0,.1);margin-bottom:6px}
+.card{background:var(--card);border-radius:16px;padding:16px;margin-top:26px;box-shadow:0 1px 6px rgba(0,0,0,.08)}
+.card h3{margin:0 0 8px;font-size:16px}.card p{margin:0;color:var(--muted);line-height:1.6}
+</style></head><body><div class="wrap">
+<div class="logo"><h1>दिशा<span>.</span></h1><p>हर खोज की सही दिशा</p></div>
+<div class="clock" id="clock"></div>
+<form id="f"><input id="q" placeholder="Google पर खोजें या वेब पता लिखें" autocomplete="off"><button>खोजें</button></form>
+<div class="chips">
+  <a class="chip" href="#" data-e="google">Google</a>
+  <a class="chip" href="#" data-e="disha">दिशा सर्च</a>
+  <a class="chip" href="#" data-e="youtube">YouTube</a>
+  <a class="chip" href="#" data-e="bing">Bing</a>
+</div>
+<div class="grid">
+  <a class="tile" href="https://www.google.com/"><div class="ic">🔎</div>Google</a>
+  <a class="tile" href="https://www.youtube.com/"><div class="ic">▶️</div>YouTube</a>
+  <a class="tile" href="https://mail.google.com/"><div class="ic">✉️</div>Gmail</a>
+  <a class="tile" href="https://www.facebook.com/"><div class="ic">👥</div>Facebook</a>
+  <a class="tile" href="https://news.google.com/home?hl=hi&gl=IN&ceid=IN:hi"><div class="ic">📰</div>ख़बरें</a>
+  <a class="tile" href="https://hi.wikipedia.org/"><div class="ic">📚</div>विकिपीडिया</a>
+  <a class="tile" href="https://www.google.com/maps"><div class="ic">🗺️</div>मैप्स</a>
+  <a class="tile" href="https://translate.google.com/?sl=auto&tl=hi"><div class="ic">🌐</div>अनुवाद</a>
+</div>
+<div class="card"><h3>💡 आज का विचार</h3><p id="thought"></p></div>
+</div>
+<script>
+var thoughts=["सफलता की शुरुआत कोशिश से होती है।","ज्ञान ही सबसे बड़ी पूँजी है।","हर दिन कुछ नया सीखिए।","मेहनत का कोई विकल्प नहीं।","छोटे कदम भी बड़ी मंज़िल तक पहुँचाते हैं।","समय का सही उपयोग ही सबसे बड़ी जीत है।","पढ़ाई आज की, कामयाबी कल की।"];
+var d=new Date();document.getElementById('thought').textContent=thoughts[d.getDate()%thoughts.length];
+function tick(){var n=new Date();document.getElementById('clock').textContent=n.toLocaleDateString('hi-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'})+' • '+n.toLocaleTimeString('hi-IN',{hour:'2-digit',minute:'2-digit'});}
+tick();setInterval(tick,30000);
+function go(e){var q=document.getElementById('q').value.trim();if(!q)return;location.href='disha://'+(e?'search':'open')+'?q='+encodeURIComponent(q)+(e?'&e='+e:'');}
+document.getElementById('f').onsubmit=function(ev){ev.preventDefault();go(null);};
+document.querySelectorAll('.chip').forEach(function(c){c.onclick=function(ev){ev.preventDefault();var q=document.getElementById('q').value.trim();if(!q){document.getElementById('q').focus();return;}go(c.dataset.e);};});
+</script>
+</body></html>

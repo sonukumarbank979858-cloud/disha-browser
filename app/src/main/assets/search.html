@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="hi"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>दिशा सर्च</title>
+<style>
+:root{--brand:#FF6D28;--bg:#ffffff;--card:#f8f8f8;--text:#1f2937;--muted:#6b7280;--link:#1a4fd8}
+@media (prefers-color-scheme:dark){:root{--bg:#121212;--card:#1e1e1e;--text:#f3f4f6;--muted:#9ca3af;--link:#8ab4f8}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text)}
+header{position:sticky;top:0;background:var(--bg);padding:12px 14px;border-bottom:1px solid rgba(128,128,128,.2);display:flex;gap:10px;align-items:center}
+.brand{font-weight:800;font-size:20px}.brand span{color:var(--brand)}
+form{flex:1;display:flex;background:var(--card);border-radius:22px;overflow:hidden}
+input{flex:1;border:0;background:transparent;padding:10px 14px;font-size:16px;color:var(--text);outline:none}
+button{border:0;background:var(--brand);color:#fff;padding:0 14px}
+main{max-width:720px;margin:auto;padding:10px 16px 40px}
+.answer{background:var(--card);border-radius:14px;padding:14px;margin:12px 0;border-left:4px solid var(--brand)}
+.answer h2{margin:0 0 6px;font-size:18px}.answer p{margin:0;line-height:1.6}
+.answer img{float:right;max-width:90px;border-radius:8px;margin-left:10px}
+.res{margin:18px 0}.res a{color:var(--link);font-size:17px;text-decoration:none}
+.res .u{color:#188038;font-size:12px;margin:2px 0}.res p{margin:4px 0 0;color:var(--muted);line-height:1.5;font-size:14px}
+.more{display:flex;flex-wrap:wrap;gap:8px;margin-top:24px}
+.more a{padding:8px 14px;border-radius:18px;background:var(--card);color:var(--text);text-decoration:none;font-size:14px}
+.muted{color:var(--muted);font-size:13px}
+</style></head><body>
+<header><div class="brand">दिशा<span>.</span></div><form id="f"><input id="q" autocomplete="off"><button>खोजें</button></form></header>
+<main>
+<div id="instant"></div>
+<div class="muted" id="status">खोज रहे हैं…</div>
+<div id="results"></div>
+<h3>इसे दूसरी जगह भी खोजें</h3>
+<div class="more" id="more"></div>
+</main>
+<script>
+var q=new URLSearchParams(location.search).get('q')||'';
+document.getElementById('q').value=q;document.title=q+' - दिशा सर्च';
+document.getElementById('f').onsubmit=function(e){e.preventDefault();var v=document.getElementById('q').value.trim();if(v)location.href='search.html?q='+encodeURIComponent(v);};
+var enc=encodeURIComponent(q);
+var others=[["Google","https://www.google.com/search?q="+enc],["YouTube","https://www.youtube.com/results?search_query="+enc],["Bing","https://www.bing.com/search?q="+enc],["DuckDuckGo","https://duckduckgo.com/?q="+enc],["समाचार","https://news.google.com/search?q="+enc+"&hl=hi&gl=IN&ceid=IN:hi"],["इमेज","https://www.google.com/search?tbm=isch&q="+enc],["मैप्स","https://www.google.com/maps/search/"+enc]];
+document.getElementById('more').innerHTML=others.map(function(o){return '<a href="'+o[1]+'">'+o[0]+'</a>';}).join('');
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function strip(s){var d=document.createElement('div');d.innerHTML=s;return d.textContent||'';}
+var inst=document.getElementById('instant');
+// Instant answers: calculator, date/time
+(function(){
+  var m=q.replace(/\s/g,'').replace(/×/g,'*').replace(/÷/g,'/');
+  if(/^[0-9+\-*/().%^]+$/.test(m)&&/[+\-*/%^]/.test(m)){
+    try{var r=Function('"use strict";return ('+m.replace(/\^/g,'**')+')')();
+      if(isFinite(r)){inst.innerHTML='<div class="answer"><h2>🧮 '+esc(q)+' = '+(Math.round(r*1e10)/1e10)+'</h2><p>दिशा कैलकुलेटर</p></div>';}}catch(e){}
+  }
+  if(/(समय|टाइम|time|तारीख|date|आज)/i.test(q)&&q.length<25){var n=new Date();
+    inst.innerHTML+='<div class="answer"><h2>🕒 '+n.toLocaleTimeString('hi-IN')+'</h2><p>'+n.toLocaleDateString('hi-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'})+'</p></div>';}
+})();
+function wiki(lang){
+  var u='https://'+lang+'.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srlimit=6&srsearch='+enc;
+  return fetch(u).then(function(r){return r.json();}).then(function(j){
+    return (j.query&&j.query.search||[]).map(function(s){return {lang:lang,title:s.title,snip:strip(s.snippet),url:'https://'+lang+'.wikipedia.org/wiki/'+encodeURIComponent(s.title.replace(/ /g,'_'))};});
+  }).catch(function(){return [];});
+}
+function summary(item){
+  if(!item)return;
+  fetch('https://'+item.lang+'.wikipedia.org/api/rest_v1/page/summary/'+encodeURIComponent(item.title.replace(/ /g,'_'))).then(function(r){return r.json();}).then(function(s){
+    if(!s.extract)return;
+    inst.innerHTML+='<div class="answer">'+(s.thumbnail?'<img src="'+esc(s.thumbnail.source)+'">':'')+'<h2>'+esc(s.title)+'</h2><p>'+esc(s.extract)+'</p><p class="muted"><a href="'+item.url+'">विकिपीडिया पर पढ़ें</a></p></div>';
+  }).catch(function(){});
+}
+if(q){
+  Promise.all([wiki('hi'),wiki('en')]).then(function(a){
+    var all=a[0].concat(a[1]);
+    document.getElementById('status').textContent=all.length?('लगभग '+all.length+' परिणाम'):'दिशा सर्च में कुछ नहीं मिला — नीचे दूसरे इंजन आज़माएँ।';
+    summary(a[0][0]||a[1][0]);
+    document.getElementById('results').innerHTML=all.map(function(r){
+      return '<div class="res"><a href="'+r.url+'">'+esc(r.title)+'</a><div class="u">'+r.lang+'.wikipedia.org</div><p>'+esc(r.snip)+'…</p></div>';
+    }).join('')+'<div class="res"><a href="https://www.google.com/search?q='+enc+'">Google पर और परिणाम देखें →</a></div>';
+  });
+}else{document.getElementById('status').textContent='कुछ लिखकर खोजें।';}
+</script>
+</body></html>
