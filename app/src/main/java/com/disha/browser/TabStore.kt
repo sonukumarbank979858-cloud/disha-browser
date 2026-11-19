@@ -99,6 +99,10 @@ class TabStore(ctx: Context) {
     fun loadThumb(id: String): Bitmap? = read(File(thumbDir, "$id.jpg"))
     fun loadFavicon(id: String): Bitmap? = read(File(favDir, "$id.png"))
 
+    fun clearAllThumbs() {
+        thumbDir.listFiles()?.forEach { it.delete() }
+    }
+
     fun deleteFiles(id: String) {
         File(thumbDir, "$id.jpg").delete()
         File(favDir, "$id.png").delete()

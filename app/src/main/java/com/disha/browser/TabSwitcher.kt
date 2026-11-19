@@ -293,7 +293,7 @@ class TabSwitcher(private val a: MainActivity) {
         }
     }
 
-    private fun thumbView(t: Tab, height: Int): View {
+    private fun thumbView(t: Tab, height: Int, roundCorners: Boolean = true): View {
         val bmp = a.thumbOf(t)
         val v: View = if (bmp != null) TopCropImageView(a).apply { setImageBitmap(bmp) } else {
             FrameLayout(a).apply {
@@ -310,40 +310,54 @@ class TabSwitcher(private val a: MainActivity) {
                 addView(inner, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
             }
         }
-        v.background = rounded(pal.thumbBg, dp(10).toFloat())
-        v.clipToOutline = true
+        if (roundCorners) {
+            v.background = rounded(pal.thumbBg, dp(10).toFloat())
+            v.clipToOutline = true
+        } else v.setBackgroundColor(pal.thumbBg)
         v.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(height))
         return v
     }
 
+    /** Height of a tab card's page preview: tall like Chrome's cards (2 columns). */
+    private fun cardThumbHeight(): Int {
+        val w = a.resources.displayMetrics.widthPixels
+        val cardW = (w - dp(12) - dp(24)) / 2
+        val tall = if (w > a.resources.displayMetrics.heightPixels) 0.6f else 1.12f
+        return (cardW * tall).toInt()
+    }
+
+    /** Chrome-style tab card: rounded card, favicon + title + ✕ on top, page preview filling the rest. */
     private fun tabCard(t: Tab): View {
         val isCurrent = t == a.current
-        val card = LinearLayout(a).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(4), dp(4), dp(4), dp(4))
-            background = rounded(pal.card, dp(16).toFloat(), if (isCurrent) dp(3) else 0,
-                ContextCompat.getColor(a, R.color.brand))
+        val radius = dp(16).toFloat()
+        val card = FrameLayout(a).apply {
+            background = rounded(pal.card, radius)
+            clipToOutline = true
             elevation = dp(2).toFloat()
+            if (isCurrent) foreground = rounded(Color.TRANSPARENT, radius, dp(3), ContextCompat.getColor(a, R.color.brand))
         }
+        val col = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
         val top = LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6), dp(2), 0, dp(4))
+            setPadding(dp(10), dp(6), dp(2), dp(6))
         }
         top.addView(favView(t, 16))
         top.addView(label(a.tabTitle(t), 13f).apply {
             isSingleLine = true
             ellipsize = TextUtils.TruncateAt.END
-            setPadding(dp(6), 0, dp(2), 0)
+            setPadding(dp(8), 0, dp(2), 0)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         top.addView(label("✕", 15f, color = pal.muted).apply {
             gravity = Gravity.CENTER
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setPadding(dp(10), dp(4), dp(10), dp(4))
             contentDescription = "टैब बंद करें"
             setOnClickListener { a.closeTab(t); render() }
         })
-        card.addView(top)
-        card.addView(thumbView(t, 160))
+        col.addView(top)
+        val thumb = thumbView(t, 0, roundCorners = false)
+        col.addView(thumb, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, cardThumbHeight()))
+        card.addView(col, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         card.setOnClickListener { a.selectFromSwitcher(t) }
         card.setOnLongClickListener { v -> tabMenu(v, t); true }
         return card

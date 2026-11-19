@@ -13,8 +13,8 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Rect
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
@@ -30,7 +30,6 @@ import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -144,14 +143,18 @@ class MainActivity : AppCompatActivity() {
         }
 
         restoreTabs()
-        val incoming = intentUrl(intent)
+        // A recreated activity (theme change, process restart) or a launch from Recents gets the
+        // old intent again; opening its URL again would add a duplicate tab every time.
+        val fromHistory = (intent?.flags ?: 0) and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        val incoming = if (savedInstanceState == null && !fromHistory) intentUrl(intent) else null
+        consumeIntent()
+        if (tabs.isNotEmpty()) {
+            val cid = store.currentId()
+            selectTab(tabs.firstOrNull { it.id == cid } ?: tabs.maxByOrNull { it.lastUsed } ?: tabs.last())
+        }
         when {
-            incoming != null -> newTab(incoming, false)
-            tabs.isEmpty() -> newTab(prefs.homeUrl(), false)
-            else -> {
-                val cid = store.currentId()
-                selectTab(tabs.firstOrNull { it.id == cid } ?: tabs.maxByOrNull { it.lastUsed } ?: tabs.last())
-            }
+            incoming != null -> openIncoming(incoming)
+            tabs.isEmpty() -> newTab(prefs.homeUrl(), false)   // fresh start: exactly one tab
         }
         store.cleanup(tabs.map { it.id }.toSet())
 
@@ -170,27 +173,67 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun isNewTabPage(u: String): Boolean =
+        u.isBlank() || u == "about:blank" || u.startsWith(Prefs.HOME) || u == prefs.homeUrl()
+
     private fun restoreTabs() {
+        tabs.clear()
+        groups.clear()
         groups.addAll(store.loadGroups())
-        if (store.hasState()) {
-            tabs.addAll(store.loadTabs())
-        } else {
-            // migrate the v1 list of open tab URLs
-            prefs.savedTabs().forEach { u -> tabs.add(Tab(newId(), false).apply { url = u }) }
+        val loaded = if (store.hasState()) store.loadTabs() else {
+            // migrate the v1 list of open tab URLs (only real pages, no repeats)
+            prefs.savedTabs().distinct().filter { !isNewTabPage(it) }.map { u -> Tab(newId(), false).apply { url = u } }
+        }
+        val seen = HashSet<String>()
+        loaded.forEach { t -> if (seen.add(t.id)) tabs.add(t) }   // never restore the same tab twice
+        val sp = getSharedPreferences("disha_fix", MODE_PRIVATE)
+        if (!sp.getBoolean("tabs_fix_v3", false)) {
+            // One-time cleanup of tabs that older versions added by themselves:
+            // repeated pages and extra empty "नया टैब" tabs.
+            val urls = HashSet<String>()
+            val cid = store.currentId()
+            tabs.sortByDescending { if (it.id == cid) Long.MAX_VALUE else it.lastUsed }
+            val keep = tabs.filter { t -> !isNewTabPage(t.url) && urls.add(t.url) }.toMutableList()
+            if (keep.isEmpty()) tabs.firstOrNull()?.let { keep.add(it) }
+            val order = tabs.toList()
+            tabs.clear()
+            tabs.addAll(order.filter { it in keep }.sortedBy { loaded.indexOf(it) })
+            store.clearAllThumbs()   // old previews were screenshots of the tab switcher
+            sp.edit().putBoolean("tabs_fix_v3", true).apply()
         }
         cleanupGroups()
     }
 
+    /** A link opened from another app or a notification: reuse a tab instead of piling up new ones. */
+    private fun openIncoming(url: String) {
+        if (switcher.isShowing) switcher.hide()
+        tabs.firstOrNull { !it.incognito && it.currentUrl() == url }?.let { selectTab(it); return }
+        val c = current
+        if (c != null && !c.incognito && isNewTabPage(c.currentUrl()) && c.web?.canGoBack() != true) {
+            selectTab(c)
+            ensureWeb(c).loadUrl(url)
+            c.url = url
+            saveState()
+            return
+        }
+        newTab(url, false)
+    }
+
+    private fun consumeIntent() {
+        setIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setClass(this, MainActivity::class.java))
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        intentUrl(intent)?.let {
-            if (switcher.isShowing) switcher.hide()
-            newTab(it, false)
-        }
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        val u = if (fromHistory) null else intentUrl(intent)
+        consumeIntent()
+        u?.let { openIncoming(it) }
     }
 
     override fun onPause() {
         super.onPause()
+        current?.let { if (!switcher.isShowing) capture(it) }
         saveState()
         CookieManager.getInstance().flush()
     }
@@ -455,7 +498,7 @@ class MainActivity : AppCompatActivity() {
 
     fun selectTab(t: Tab) {
         val old = current
-        if (old != null && old != t && !switcher.isShowing) capture(old)
+        if (old != null && old != t && old.web?.parent == container && !switcher.isShowing) capture(old)
         val w = ensureWeb(t)
         container.removeAllViews()
         (w.parent as? ViewGroup)?.removeView(w)
@@ -517,32 +560,27 @@ class MainActivity : AppCompatActivity() {
         tabs.forEach { t -> if (t.groupId != null && groups.none { it.id == t.groupId }) t.groupId = null }
     }
 
-    /** Takes a small screenshot of the visible page for the tab card. */
+    /**
+     * Takes a small picture of the page for the tab card by drawing only the WebView into a bitmap
+     * (never the window, so the tab switcher or menus can never end up in the preview).
+     */
     private fun capture(t: Tab, done: (() -> Unit)? = null) {
         val w = t.web
-        if (w == null || w.parent == null || !w.isAttachedToWindow || w.width <= 0 || w.height <= 0 ||
-            fullscreenView != null || switcher.isShowing) {
-            done?.invoke(); return
+        if (w != null && w.isAttachedToWindow && w.width > 0 && w.height > 0 && fullscreenView == null) {
+            try {
+                val scale = 0.45f
+                val bmp = Bitmap.createBitmap(maxOf(1, (w.width * scale).toInt()), maxOf(1, (w.height * scale).toInt()), Bitmap.Config.ARGB_8888)
+                val c = Canvas(bmp)
+                c.drawColor(Color.WHITE)
+                c.scale(scale, scale)
+                c.translate(-w.scrollX.toFloat(), -w.scrollY.toFloat())
+                w.draw(c)
+                t.thumb = bmp
+                t.thumbLoaded = true
+                if (!t.incognito) store.saveThumb(t.id, bmp)
+            } catch (e: Throwable) { }
         }
-        val loc = IntArray(2)
-        w.getLocationInWindow(loc)
-        val scale = 0.45f
-        val bmp = try {
-            Bitmap.createBitmap(maxOf(1, (w.width * scale).toInt()), maxOf(1, (w.height * scale).toInt()), Bitmap.Config.ARGB_8888)
-        } catch (e: Throwable) { done?.invoke(); return }
-        val rect = Rect(loc[0], loc[1], loc[0] + w.width, loc[1] + w.height)
-        try {
-            PixelCopy.request(window, rect, bmp, { result ->
-                if (result == PixelCopy.SUCCESS) {
-                    t.thumb = bmp
-                    t.thumbLoaded = true
-                    if (!t.incognito) store.saveThumb(t.id, bmp)
-                }
-                done?.invoke()
-            }, main)
-        } catch (e: Exception) {
-            done?.invoke()
-        }
+        done?.invoke()
     }
 
     fun openSwitcher() {
@@ -551,8 +589,8 @@ class MainActivity : AppCompatActivity() {
         hideKeyboard(urlBar)
         urlBar.clearFocus()
         val mode = if (current?.incognito == true) TabSwitcher.INCOGNITO else TabSwitcher.NORMAL
-        val c = current
-        if (c == null) switcher.show(mode) else capture(c) { switcher.show(mode) }
+        current?.let { capture(it) }   // picture of the page first, then show the switcher
+        switcher.show(mode)
     }
 
     fun closeSwitcher() {
@@ -799,7 +837,7 @@ class MainActivity : AppCompatActivity() {
             }
             t.groupId?.let { gid -> groups.firstOrNull { it.id == gid }?.updated = System.currentTimeMillis() }
             if (!t.incognito) saveState()
-            main.postDelayed({ if (current == t && menuPopup == null) capture(t) }, 1200)
+            main.postDelayed({ if (current == t && !switcher.isShowing) capture(t) }, 1200)
         }
     }
 
