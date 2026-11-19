@@ -38,7 +38,7 @@ class DailyWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx,
             val r = Updates.latest()
             if (r != null && r.first > BuildConfig.VERSION_CODE) {
                 Notify.show(ctx, 200, Notify.CH_UPDATE, "दिशा ब्राउज़र का नया वर्ज़न आया है",
-                    listOf("v1.0.${r.first} उपलब्ध है — टैप करके डाउनलोड करें"), r.second)
+                    listOf("v${Updates.versionName(r.first)} उपलब्ध है — टैप करके डाउनलोड करें"), r.second)
             }
         } catch (_: Exception) { }
         return Result.success()
@@ -94,6 +94,9 @@ object News {
 
 object Updates {
     const val REPO = "sonukumarbank979858-cloud/disha-browser"
+
+    /** Release tag number -> shown version (v1.1.x line started with run 2). */
+    fun versionName(code: Int): String = if (code >= 2) "1.1.$code" else "1.0.$code"
 
     /** Returns (latest versionCode, release page url) or null. */
     fun latest(): Pair<Int, String>? {

@@ -6,22 +6,31 @@ import android.app.Activity
 import android.app.DownloadManager
 import android.app.SearchManager
 import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import android.speech.RecognizerIntent
 import android.text.InputType
-import android.text.TextUtils
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -38,12 +47,16 @@ import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.ArrayAdapter
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
-import android.widget.PopupMenu
+import android.widget.PopupWindow
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -62,24 +75,28 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.net.URLEncoder
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
 
-    class Tab(val web: WebView, val incognito: Boolean) {
-        var desktop = false
-    }
-
-    private val tabs = mutableListOf<Tab>()
-    private var current: Tab? = null
-    private val closedUrls = ArrayDeque<String>()
+    val tabs = mutableListOf<Tab>()
+    val groups = mutableListOf<TabGroup>()
+    var current: Tab? = null
+        private set
     private lateinit var prefs: Prefs
+    private lateinit var store: TabStore
+    private lateinit var switcher: TabSwitcher
 
     private lateinit var root: LinearLayout
     private lateinit var topBar: LinearLayout
+    private lateinit var urlBox: LinearLayout
     private lateinit var urlBar: EditText
+    private lateinit var homeBtn: TextView
+    private lateinit var micBtn: TextView
     private lateinit var tabBtn: TextView
+    private lateinit var menuBtn: TextView
     private lateinit var progress: ProgressBar
     private lateinit var swipe: SwipeRefreshLayout
     private lateinit var container: FrameLayout
@@ -87,6 +104,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var findInput: EditText
     private lateinit var findCount: TextView
     private var urlDefaultColors: ColorStateList? = null
+    private var menuPopup: PopupWindow? = null
+    private val main = Handler(Looper.getMainLooper())
 
     @Volatile private var adBlockOn = true
     private var fullscreenView: View? = null
@@ -105,12 +124,16 @@ class MainActivity : AppCompatActivity() {
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    fun isNight(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
 
     override fun onCreate(savedInstanceState: Bundle?) {
         prefs = Prefs(this)
         prefs.applyNightMode()
         super.onCreate(savedInstanceState)
+        store = TabStore(this)
         adBlockOn = prefs.adBlock
         buildUi()
         Notify.channels(this)
@@ -120,21 +143,26 @@ class MainActivity : AppCompatActivity() {
             permLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
         }
 
-        prefs.savedTabs().forEach { newTab(it, false, select = false) }
+        restoreTabs()
         val incoming = intentUrl(intent)
         when {
             incoming != null -> newTab(incoming, false)
             tabs.isEmpty() -> newTab(prefs.homeUrl(), false)
-            else -> selectTab(tabs.last())
+            else -> {
+                val cid = store.currentId()
+                selectTab(tabs.firstOrNull { it.id == cid } ?: tabs.maxByOrNull { it.lastUsed } ?: tabs.last())
+            }
         }
+        store.cleanup(tabs.map { it.id }.toSet())
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 val c = current
                 when {
                     fullscreenView != null -> fullscreenCallback?.onCustomViewHidden()
+                    switcher.onBack() -> Unit
                     findBar.visibility == View.VISIBLE -> closeFind()
-                    c != null && c.web.canGoBack() -> c.web.goBack()
+                    c?.web?.canGoBack() == true -> c?.web?.goBack()
                     c != null && tabs.size > 1 -> closeTab(c)
                     else -> finish()
                 }
@@ -142,21 +170,46 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun restoreTabs() {
+        groups.addAll(store.loadGroups())
+        if (store.hasState()) {
+            tabs.addAll(store.loadTabs())
+        } else {
+            // migrate the v1 list of open tab URLs
+            prefs.savedTabs().forEach { u -> tabs.add(Tab(newId(), false).apply { url = u }) }
+        }
+        cleanupGroups()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        intentUrl(intent)?.let { newTab(it, false) }
+        intentUrl(intent)?.let {
+            if (switcher.isShowing) switcher.hide()
+            newTab(it, false)
+        }
     }
 
     override fun onPause() {
         super.onPause()
-        prefs.saveTabs(tabs.filter { !it.incognito }.mapNotNull { it.web.url })
+        saveState()
         CookieManager.getInstance().flush()
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (switcher.isShowing) switcher.render()
+    }
+
     override fun onDestroy() {
-        tabs.forEach { it.web.destroy() }
+        menuPopup?.dismiss()
+        tabs.forEach { it.web?.destroy() }
         tabs.clear()
         super.onDestroy()
+    }
+
+    fun saveState() {
+        if (!::store.isInitialized) return
+        store.save(tabs, groups, current?.takeIf { !it.incognito }?.id)
     }
 
     private fun intentUrl(i: Intent?): String? {
@@ -171,12 +224,13 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- UI ----------------
 
-    private fun iconButton(label: String, onClick: (View) -> Unit): TextView =
+    private fun iconButton(label: String, desc: String, onClick: (View) -> Unit): TextView =
         TextView(this).apply {
             text = label
             textSize = 20f
             gravity = Gravity.CENTER
-            minWidth = dp(40)
+            minWidth = dp(42)
+            contentDescription = desc
             setPadding(dp(8), dp(6), dp(8), dp(6))
             setOnClickListener { onClick(it) }
         }
@@ -187,18 +241,23 @@ class MainActivity : AppCompatActivity() {
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(6), dp(4), dp(6))
+            setPadding(dp(2), dp(6), dp(2), dp(6))
         }
-        val home = iconButton("⌂") { current?.web?.loadUrl(prefs.homeUrl()) }
+        homeBtn = iconButton("⌂", "होम") { current?.web?.loadUrl(prefs.homeUrl()) }.apply { textSize = 24f }
+        urlBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.url_bg)
+        }
         urlBar = EditText(this).apply {
             hint = "खोजें या वेब पता लिखें"
             isSingleLine = true
             textSize = 15f
+            background = null
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             imeOptions = EditorInfo.IME_ACTION_GO
             setSelectAllOnFocus(true)
-            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.url_bg)
-            setPadding(dp(14), dp(8), dp(14), dp(8))
+            setPadding(dp(14), dp(9), dp(4), dp(9))
             setOnEditorActionListener { _, action, ev ->
                 if (action == EditorInfo.IME_ACTION_GO || ev?.keyCode == KeyEvent.KEYCODE_ENTER) {
                     go(text.toString()); true
@@ -206,16 +265,28 @@ class MainActivity : AppCompatActivity() {
             }
         }
         urlDefaultColors = urlBar.textColors
-        val mic = iconButton("🎤") { startVoice() }.apply { textSize = 17f }
-        tabBtn = iconButton("1") { showTabs() }.apply {
+        micBtn = iconButton("🎤", "वॉइस सर्च") { startVoice() }.apply { textSize = 16f; minWidth = dp(36) }
+        urlBox.addView(urlBar, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        urlBox.addView(micBtn)
+
+        tabBtn = TextView(this).apply {
+            text = "1"
+            textSize = 13f
+            gravity = Gravity.CENTER
             setTypeface(typeface, Typeface.BOLD)
-            textSize = 16f
+            contentDescription = "खुले टैब देखें"
+            setOnClickListener { openSwitcher() }
         }
-        val menuBtn = iconButton("⋮") { v -> showMenu(v) }
-        topBar.addView(home)
-        topBar.addView(urlBar, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        topBar.addView(mic)
-        topBar.addView(tabBtn)
+        val tabBtnBox = FrameLayout(this).apply {
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setOnClickListener { openSwitcher() }
+        }
+        tabBtnBox.addView(tabBtn, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+        menuBtn = iconButton("⋮", "मेनू") { v -> showMenu(v) }.apply { textSize = 22f }
+
+        topBar.addView(homeBtn)
+        topBar.addView(urlBox, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(2) })
+        topBar.addView(tabBtnBox)
         topBar.addView(menuBtn)
 
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -239,9 +310,9 @@ class MainActivity : AppCompatActivity() {
         findCount = TextView(this).apply { text = "0/0"; setPadding(dp(6), 0, dp(6), 0) }
         findBar.addView(findInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         findBar.addView(findCount)
-        findBar.addView(iconButton("▲") { current?.web?.findNext(false) })
-        findBar.addView(iconButton("▼") { current?.web?.findNext(true) })
-        findBar.addView(iconButton("✕") { closeFind() })
+        findBar.addView(iconButton("▲", "पिछला") { current?.web?.findNext(false) })
+        findBar.addView(iconButton("▼", "अगला") { current?.web?.findNext(true) })
+        findBar.addView(iconButton("✕", "बंद करें") { closeFind() })
 
         container = FrameLayout(this)
         swipe = SwipeRefreshLayout(this).apply {
@@ -255,12 +326,17 @@ class MainActivity : AppCompatActivity() {
         root.addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)))
         root.addView(findBar)
         root.addView(swipe, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        setContentView(root)
+
+        val frame = FrameLayout(this)
+        frame.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        switcher = TabSwitcher(this)
+        frame.addView(switcher.view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        setContentView(frame)
     }
 
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    private fun hideKeyboard(v: View) {
+    fun hideKeyboard(v: View) {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(v.windowToken, 0)
     }
 
@@ -272,7 +348,53 @@ class MainActivity : AppCompatActivity() {
         return url
     }
 
+    private fun applyToolbarColors() {
+        val t = current
+        val incog = t?.incognito == true
+        if (incog) {
+            topBar.setBackgroundColor(Color.parseColor("#2B2B2B"))
+            urlBar.setTextColor(Color.WHITE)
+            urlBar.setHintTextColor(Color.LTGRAY)
+        } else {
+            topBar.setBackgroundColor(Color.TRANSPARENT)
+            urlDefaultColors?.let { urlBar.setTextColor(it) }
+            urlBar.setHintTextColor(Color.GRAY)
+        }
+        val c = if (incog) Color.WHITE else urlBar.currentTextColor
+        listOf(homeBtn, micBtn, tabBtn, menuBtn).forEach { it.setTextColor(c) }
+        tabBtn.background = rounded(Color.TRANSPARENT, dp(5).toFloat(), dp(2), c)
+    }
+
     // ---------------- Tabs ----------------
+
+    fun tabTitle(t: Tab): String {
+        val u = t.currentUrl()
+        if (u.startsWith(Prefs.HOME) || u == "about:blank" || u.isBlank()) return "नया टैब"
+        val title = t.currentTitle()
+        return if (title.isBlank() || title.endsWith(".html")) hostOf(t).ifBlank { "नया टैब" } else title
+    }
+
+    fun hostOf(t: Tab): String {
+        val u = t.currentUrl()
+        if (u.startsWith("file:///android_asset/search.html")) return "दिशा सर्च"
+        if (u.startsWith("file:") || u.startsWith("about:")) return "दिशा"
+        return Uri.parse(u).host?.removePrefix("www.") ?: u
+    }
+
+    fun thumbOf(t: Tab): Bitmap? {
+        if (t.thumb == null && !t.thumbLoaded && !t.incognito) t.thumb = store.loadThumb(t.id)
+        t.thumbLoaded = true
+        return t.thumb
+    }
+
+    fun faviconOf(t: Tab): Bitmap? {
+        if (t.favicon == null) t.web?.favicon?.let { t.favicon = it }
+        if (t.favicon == null && !t.favLoaded && !t.incognito) t.favicon = store.loadFavicon(t.id)
+        t.favLoaded = true
+        return t.favicon
+    }
+
+    fun groupMembers(g: TabGroup): List<Tab> = tabs.filter { it.groupId == g.id }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun createWebView(incognito: Boolean): WebView {
@@ -304,95 +426,311 @@ class MainActivity : AppCompatActivity() {
         return w
     }
 
+    private fun ensureWeb(t: Tab): WebView {
+        t.web?.let { return it }
+        val w = createWebView(t.incognito)
+        if (t.desktop) w.settings.userAgentString = DESKTOP_UA
+        t.web = w
+        w.loadUrl(t.url.ifBlank { prefs.homeUrl() })
+        return w
+    }
+
     private fun tabOf(v: WebView?): Tab? = tabs.firstOrNull { it.web == v }
 
-    private fun newTab(url: String, incognito: Boolean, select: Boolean = true) {
-        val t = Tab(createWebView(incognito), incognito)
-        tabs.add(t)
-        t.web.loadUrl(url)
+    fun newTab(url: String, incognito: Boolean, groupId: String? = null, select: Boolean = true) {
+        val t = Tab(newId(), incognito)
+        t.url = url
+        val g = if (incognito) null else groupId?.let { id -> groups.firstOrNull { it.id == id } }
+        t.groupId = g?.id
+        val idx = if (g != null) tabs.indexOfLast { it.groupId == g.id } else -1
+        if (idx >= 0) tabs.add(idx + 1, t) else tabs.add(t)
+        g?.updated = System.currentTimeMillis()
         if (select) {
+            ensureWeb(t)
             selectTab(t)
             if (incognito) toast("इनकॉग्निटो टैब: इतिहास और कैश सेव नहीं होगा")
         } else updateTabCount()
+        saveState()
     }
 
-    private fun selectTab(t: Tab) {
+    fun selectTab(t: Tab) {
+        val old = current
+        if (old != null && old != t && !switcher.isShowing) capture(old)
+        val w = ensureWeb(t)
         container.removeAllViews()
-        (t.web.parent as? ViewGroup)?.removeView(t.web)
-        container.addView(t.web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        (w.parent as? ViewGroup)?.removeView(w)
+        container.addView(w, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         current = t
-        urlBar.setText(displayUrl(t.web.url))
-        if (t.incognito) {
-            topBar.setBackgroundColor(Color.parseColor("#2B2B2B"))
-            urlBar.setTextColor(Color.WHITE)
-            urlBar.setHintTextColor(Color.LTGRAY)
-            tabBtn.setTextColor(Color.WHITE)
-        } else {
-            topBar.setBackgroundColor(Color.TRANSPARENT)
-            urlDefaultColors?.let { urlBar.setTextColor(it) }
-            tabBtn.setTextColor(urlBar.currentTextColor)
-        }
+        t.lastUsed = System.currentTimeMillis()
+        urlBar.setText(displayUrl(w.url ?: t.url))
+        if (findBar.visibility == View.VISIBLE) closeFind()
+        applyToolbarColors()
         updateTabCount()
     }
 
-    private fun closeTab(t: Tab) {
+    fun closeTab(t: Tab) {
         val idx = tabs.indexOf(t)
         if (idx < 0) return
-        if (!t.incognito) t.web.url?.let { if (it.startsWith("http")) closedUrls.addLast(it) }
-        tabs.removeAt(idx)
-        container.removeView(t.web)
-        t.web.destroy()
-        when {
-            tabs.isEmpty() -> newTab(prefs.homeUrl(), false)
-            current == t -> selectTab(tabs[minOf(idx, tabs.size - 1)])
-            else -> updateTabCount()
+        if (!t.incognito) {
+            val u = t.currentUrl()
+            if (u.startsWith("http")) prefs.addEntry("closed", tabTitle(t), u, 25)
         }
+        tabs.removeAt(idx)
+        t.web?.let { container.removeView(it); it.destroy() }
+        t.web = null
+        store.deleteFiles(t.id)
+        t.groupId?.let { gid -> groups.firstOrNull { it.id == gid }?.updated = System.currentTimeMillis() }
+        cleanupGroups()
+        if (current == t) {
+            current = null
+            if (!switcher.isShowing) {
+                val sameMode = tabs.filter { it.incognito == t.incognito }
+                when {
+                    sameMode.isNotEmpty() -> selectTab(sameMode[minOf(idx, sameMode.size - 1).coerceAtLeast(0)])
+                    tabs.isNotEmpty() -> selectTab(tabs.maxByOrNull { it.lastUsed } ?: tabs.last())
+                    else -> newTab(prefs.homeUrl(), false)
+                }
+            }
+        }
+        updateTabCount()
+        saveState()
+    }
+
+    fun closeAllTabs(incognito: Boolean, done: () -> Unit) {
+        val list = tabs.filter { it.incognito == incognito }
+        if (list.isEmpty()) { done(); return }
+        AlertDialog.Builder(this)
+            .setMessage(if (incognito) "सभी ${list.size} इनकॉग्निटो टैब बंद करें?" else "सभी ${list.size} टैब बंद करें?")
+            .setPositiveButton("बंद करें") { _, _ -> list.forEach { closeTab(it) }; done() }
+            .setNegativeButton("रद्द करें", null)
+            .show()
     }
 
     private fun updateTabCount() {
-        tabBtn.text = tabs.size.toString()
+        val incog = current?.incognito == true
+        val n = tabs.count { it.incognito == incog }
+        tabBtn.text = if (n > 99) ":D" else n.toString()
     }
 
-    private fun showTabs() {
-        lateinit var dialog: AlertDialog
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(12), dp(8))
+    private fun cleanupGroups() {
+        groups.removeAll { g -> tabs.none { it.groupId == g.id } }
+        tabs.forEach { t -> if (t.groupId != null && groups.none { it.id == t.groupId }) t.groupId = null }
+    }
+
+    /** Takes a small screenshot of the visible page for the tab card. */
+    private fun capture(t: Tab, done: (() -> Unit)? = null) {
+        val w = t.web
+        if (w == null || w.parent == null || !w.isAttachedToWindow || w.width <= 0 || w.height <= 0 ||
+            fullscreenView != null || switcher.isShowing) {
+            done?.invoke(); return
         }
-        tabs.toList().forEach { t ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(8), 0, dp(8))
-            }
-            val name = t.web.title?.takeIf { it.isNotBlank() && !it.endsWith(".html") } ?: "नया टैब"
-            val label = TextView(this).apply {
-                text = (if (t.incognito) "🕶 " else "") + name + "\n" + displayUrl(t.web.url)
-                maxLines = 2
-                ellipsize = TextUtils.TruncateAt.END
-                textSize = 15f
-                if (t == current) setTypeface(null, Typeface.BOLD)
-                setOnClickListener { selectTab(t); dialog.dismiss() }
-            }
-            val x = iconButton("✕") { closeTab(t); dialog.dismiss(); showTabs() }
-            row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(x)
-            box.addView(row)
+        val loc = IntArray(2)
+        w.getLocationInWindow(loc)
+        val scale = 0.45f
+        val bmp = try {
+            Bitmap.createBitmap(maxOf(1, (w.width * scale).toInt()), maxOf(1, (w.height * scale).toInt()), Bitmap.Config.ARGB_8888)
+        } catch (e: Throwable) { done?.invoke(); return }
+        val rect = Rect(loc[0], loc[1], loc[0] + w.width, loc[1] + w.height)
+        try {
+            PixelCopy.request(window, rect, bmp, { result ->
+                if (result == PixelCopy.SUCCESS) {
+                    t.thumb = bmp
+                    t.thumbLoaded = true
+                    if (!t.incognito) store.saveThumb(t.id, bmp)
+                }
+                done?.invoke()
+            }, main)
+        } catch (e: Exception) {
+            done?.invoke()
         }
-        dialog = AlertDialog.Builder(this)
-            .setTitle("खुले टैब (${tabs.size})")
-            .setView(ScrollView(this).apply { addView(box) })
-            .setPositiveButton("+ नया टैब") { _, _ -> newTab(prefs.homeUrl(), false) }
-            .setNeutralButton("+ इनकॉग्निटो") { _, _ -> newTab(prefs.homeUrl(), true) }
-            .setNegativeButton("सभी बंद करें") { _, _ -> tabs.toList().forEach { closeTab(it) } }
-            .create()
-        dialog.show()
+    }
+
+    fun openSwitcher() {
+        menuPopup?.dismiss()
+        if (switcher.isShowing) return
+        hideKeyboard(urlBar)
+        urlBar.clearFocus()
+        val mode = if (current?.incognito == true) TabSwitcher.INCOGNITO else TabSwitcher.NORMAL
+        val c = current
+        if (c == null) switcher.show(mode) else capture(c) { switcher.show(mode) }
+    }
+
+    fun closeSwitcher() {
+        switcher.hide()
+        val c = current
+        if (c != null && tabs.contains(c)) { selectTab(c); return }
+        val pref = tabs.filter { it.incognito == (switcher.mode == TabSwitcher.INCOGNITO) }
+        when {
+            pref.isNotEmpty() -> selectTab(pref.maxByOrNull { it.lastUsed } ?: pref.last())
+            tabs.isNotEmpty() -> selectTab(tabs.maxByOrNull { it.lastUsed } ?: tabs.last())
+            else -> newTab(prefs.homeUrl(), false)
+        }
+    }
+
+    fun selectFromSwitcher(t: Tab) {
+        switcher.hide()
+        selectTab(t)
+    }
+
+    fun newTabFromSwitcher(incognito: Boolean, groupId: String?) {
+        switcher.hide()
+        newTab(prefs.homeUrl(), incognito, groupId)
+    }
+
+    // ---------------- Tab groups ----------------
+
+    private fun dot(color: Int, text: String): CharSequence {
+        val sb = SpannableStringBuilder("●  ")
+        sb.setSpan(ForegroundColorSpan(color), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.append(text)
+        return sb
+    }
+
+    fun moveToGroup(t: Tab, g: TabGroup) {
+        if (t.incognito) return
+        t.groupId = g.id
+        tabs.remove(t)
+        val idx = tabs.indexOfLast { it.groupId == g.id }
+        if (idx >= 0) tabs.add(idx + 1, t) else tabs.add(t)
+        g.updated = System.currentTimeMillis()
+        cleanupGroups()
+        saveState()
+    }
+
+    fun removeFromGroup(t: Tab) {
+        val gid = t.groupId ?: return
+        t.groupId = null
+        groups.firstOrNull { it.id == gid }?.updated = System.currentTimeMillis()
+        cleanupGroups()
+        saveState()
+        toast("टैब ग्रुप से हटा दिया")
+    }
+
+    fun addToGroupDialog(t: Tab?, done: () -> Unit = {}) {
+        if (t == null) return
+        if (t.incognito) { toast("इनकॉग्निटो टैब ग्रुप में नहीं जोड़े जा सकते"); return }
+        val others = groups.filter { it.id != t.groupId }
+        val items = mutableListOf<CharSequence>("＋  नया टैब ग्रुप")
+        others.forEach { g -> items.add(dot(g.color, "${g.name.ifBlank { "बिना नाम" }}  (${groupMembers(g).size} टैब)")) }
+        AlertDialog.Builder(this)
+            .setTitle("टैब को ग्रुप में जोड़ें")
+            .setItems(items.toTypedArray()) { _, i ->
+                if (i == 0) newGroupDialog(t, done)
+                else {
+                    val g = others[i - 1]
+                    moveToGroup(t, g)
+                    toast("“${g.name}” ग्रुप में जोड़ दिया")
+                    done()
+                }
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
+    }
+
+    private fun colorPicker(initial: Int): Pair<View, () -> Int> {
+        var sel = GroupColors.values.indexOf(initial).coerceAtLeast(0)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(12), 0, dp(4)) }
+        val dots = mutableListOf<View>()
+        fun refresh() {
+            dots.forEachIndexed { i, v ->
+                v.background = circle(GroupColors.values[i], if (i == sel) dp(4) else 0, if (isNight()) Color.WHITE else Color.BLACK)
+            }
+        }
+        GroupColors.values.forEachIndexed { i, _ ->
+            val v = View(this).apply {
+                contentDescription = GroupColors.names[i]
+                setOnClickListener { sel = i; refresh() }
+            }
+            dots.add(v)
+            row.addView(v, LinearLayout.LayoutParams(dp(34), dp(34)).apply { marginEnd = dp(10) })
+        }
+        refresh()
+        val hs = HorizontalScrollView(this).apply { addView(row) }
+        return Pair(hs, { GroupColors.values[sel] })
+    }
+
+    private fun newGroupDialog(t: Tab, done: () -> Unit) {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(22), dp(8), dp(22), 0) }
+        val name = EditText(this).apply {
+            hint = "ग्रुप का नाम"
+            isSingleLine = true
+            setText(t.currentTitle().takeIf { it.isNotBlank() && !it.endsWith(".html") }?.take(20) ?: "ग्रुप ${groups.size + 1}")
+            setSelectAllOnFocus(true)
+        }
+        val (picker, color) = colorPicker(GroupColors.values[(groups.size + 1) % GroupColors.values.size])
+        box.addView(name)
+        box.addView(picker)
+        AlertDialog.Builder(this)
+            .setTitle("नया टैब ग्रुप")
+            .setView(box)
+            .setPositiveButton("बनाएँ") { _, _ ->
+                val g = TabGroup(newId(), name.text.toString().trim().ifBlank { "ग्रुप ${groups.size + 1}" }, color(), System.currentTimeMillis())
+                groups.add(g)
+                moveToGroup(t, g)
+                toast("“${g.name}” ग्रुप बन गया")
+                done()
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
+    }
+
+    fun renameGroupDialog(g: TabGroup, done: () -> Unit) {
+        val input = EditText(this).apply {
+            setText(g.name)
+            isSingleLine = true
+            setSelectAllOnFocus(true)
+        }
+        val box = FrameLayout(this).apply { setPadding(dp(22), dp(8), dp(22), 0); addView(input) }
+        AlertDialog.Builder(this)
+            .setTitle("ग्रुप का नाम बदलें")
+            .setView(box)
+            .setPositiveButton("सेव करें") { _, _ ->
+                g.name = input.text.toString().trim()
+                g.updated = System.currentTimeMillis()
+                saveState(); done()
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
+    }
+
+    fun colorDialog(g: TabGroup, done: () -> Unit) {
+        val items = GroupColors.values.mapIndexed { i, c -> dot(c, GroupColors.names[i]) }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("ग्रुप का रंग बदलें")
+            .setSingleChoiceItems(items, GroupColors.values.indexOf(g.color)) { d, i ->
+                g.color = GroupColors.values[i]
+                g.updated = System.currentTimeMillis()
+                saveState(); d.dismiss(); done()
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
+    }
+
+    fun ungroup(g: TabGroup) {
+        tabs.forEach { if (it.groupId == g.id) it.groupId = null }
+        groups.remove(g)
+        saveState()
+        toast("ग्रुप हटा दिया, टैब खुले हैं")
+    }
+
+    fun closeGroup(g: TabGroup, done: () -> Unit) {
+        val members = groupMembers(g)
+        AlertDialog.Builder(this)
+            .setMessage("“${g.name.ifBlank { "ग्रुप" }}” के ${members.size} टैब बंद करें?")
+            .setPositiveButton("ग्रुप बंद करें") { _, _ ->
+                members.forEach { closeTab(it) }
+                groups.remove(g)
+                saveState(); done()
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
     }
 
     // ---------------- Navigation ----------------
 
     private fun go(input: String) {
-        current?.web?.loadUrl(toUrl(input))
+        val w = current?.web ?: run { newTab(toUrl(input), false); return }
+        w.loadUrl(toUrl(input))
         hideKeyboard(urlBar)
         urlBar.clearFocus()
     }
@@ -445,16 +783,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+            val t = tabOf(view)
+            if (t != null && url != null) t.url = url
             if (view == current?.web && !urlBar.hasFocus()) urlBar.setText(displayUrl(url))
         }
 
         override fun onPageFinished(view: WebView, url: String?) {
             swipe.isRefreshing = false
             val t = tabOf(view) ?: return
+            if (url != null) t.url = url
+            view.title?.let { if (it.isNotBlank()) t.title = it }
             if (view == current?.web && !urlBar.hasFocus()) urlBar.setText(displayUrl(url))
             if (!t.incognito && url != null && url.startsWith("http")) {
                 prefs.addEntry("history", view.title ?: url, url, 500)
             }
+            t.groupId?.let { gid -> groups.firstOrNull { it.id == gid }?.updated = System.currentTimeMillis() }
+            if (!t.incognito) saveState()
+            main.postDelayed({ if (current == t && menuPopup == null) capture(t) }, 1200)
         }
     }
 
@@ -464,6 +809,19 @@ class MainActivity : AppCompatActivity() {
                 progress.progress = newProgress
                 progress.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
             }
+        }
+
+        override fun onReceivedTitle(view: WebView, title: String?) {
+            val t = tabOf(view) ?: return
+            if (!title.isNullOrBlank()) t.title = title
+        }
+
+        override fun onReceivedIcon(view: WebView, icon: Bitmap?) {
+            val t = tabOf(view) ?: return
+            if (icon == null) return
+            t.favicon = icon
+            t.favLoaded = true
+            if (!t.incognito) store.saveFavicon(t.id, icon)
         }
 
         override fun onShowCustomView(view: View, callback: CustomViewCallback) {
@@ -522,58 +880,140 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------------- Menu ----------------
+    // ---------------- Main ⋮ menu (Chrome style) ----------------
 
     private fun showMenu(anchor: View) {
-        val pm = PopupMenu(this, anchor)
-        val items = listOf(
-            1 to "← पीछे", 2 to "→ आगे", 3 to "⟳ रीलोड करें",
-            4 to "नया टैब", 5 to "नया इनकॉग्निटो टैब", 6 to "बंद किया टैब फिर खोलें",
-            7 to "☆ बुकमार्क जोड़ें", 8 to "बुकमार्क", 9 to "इतिहास (History)", 10 to "डाउनलोड",
-            11 to "पेज में खोजें", 12 to "शेयर करें", 13 to "हिंदी में अनुवाद करें", 14 to "रीडिंग मोड",
-            15 to "डेस्कटॉप साइट", 16 to "होम स्क्रीन पर जोड़ें", 17 to "ब्राउज़िंग डेटा हटाएँ",
-            18 to "आज की ताज़ा ख़बरें", 19 to "सेटिंग्स", 20 to "अपडेट जाँचें"
-        )
-        items.forEach { (id, title) -> pm.menu.add(0, id, id, title) }
-        pm.menu.findItem(15).isCheckable = true
-        pm.menu.findItem(15).isChecked = current?.desktop == true
-        pm.setOnMenuItemClickListener { onMenu(it.itemId); true }
-        pm.show()
-    }
-
-    private fun onMenu(id: Int) {
-        val w = current?.web
-        when (id) {
-            1 -> if (w?.canGoBack() == true) w?.goBack()
-            2 -> if (w?.canGoForward() == true) w?.goForward()
-            3 -> w?.reload()
-            4 -> newTab(prefs.homeUrl(), false)
-            5 -> newTab(prefs.homeUrl(), true)
-            6 -> closedUrls.removeLastOrNull()?.let { newTab(it, false) } ?: toast("कोई बंद टैब नहीं है")
-            7 -> addBookmark()
-            8 -> showList("बुकमार्क", "bookmarks")
-            9 -> showList("इतिहास", "history")
-            10 -> try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) } catch (e: Exception) { toast("डाउनलोड फ़ोल्डर नहीं खुल पाया") }
-            11 -> openFind()
-            12 -> share()
-            13 -> translate()
-            14 -> readingMode()
-            15 -> toggleDesktop()
-            16 -> addShortcut()
-            17 -> clearData()
-            18 -> newTab(News.PAGE, false)
-            19 -> showSettings()
-            20 -> checkUpdate()
+        menuPopup?.dismiss()
+        val t = current
+        val w = t?.web
+        val pal = Palette(isNight() || t?.incognito == true)
+        val pop = PopupWindow(this)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(4), 0, dp(8))
         }
+
+        // top icon row: पीछे, आगे, बुकमार्क, डाउनलोड, रीफ़्रेश
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        fun top(sym: String, desc: String, enabled: Boolean, color: Int = pal.text, action: () -> Unit) {
+            val v = TextView(this).apply {
+                text = sym
+                textSize = 21f
+                gravity = Gravity.CENTER
+                setTextColor(color)
+                contentDescription = desc
+                alpha = if (enabled) 1f else 0.3f
+                setPadding(0, dp(10), 0, dp(10))
+                if (enabled) setOnClickListener { pop.dismiss(); action() }
+                setOnLongClickListener { toast(desc); true }
+            }
+            row.addView(v, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val url = pageUrl()
+        val starred = url != null && prefs.list("bookmarks").any { it.url == url }
+        top("←", "पीछे", w?.canGoBack() == true) { w?.goBack() }
+        top("→", "आगे", w?.canGoForward() == true) { w?.goForward() }
+        top(if (starred) "★" else "☆", if (starred) "बुकमार्क हटाएँ" else "बुकमार्क करें", url != null,
+            if (starred) ContextCompat.getColor(this, R.color.brand) else pal.text) { toggleBookmark() }
+        top("⤓", "पेज डाउनलोड करें", url != null) { downloadPage() }
+        top("⟳", "रीफ़्रेश", w != null) { w?.reload() }
+        box.addView(row)
+
+        fun divider() {
+            box.addView(View(this).apply { setBackgroundColor(pal.divider) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(4), 0, dp(4)) })
+        }
+        fun item(icon: String, label: String, checked: Boolean? = null, action: () -> Unit) {
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), dp(11), dp(12), dp(11))
+                isClickable = true
+                setOnClickListener { pop.dismiss(); action() }
+            }
+            r.addView(TextView(this).apply {
+                text = icon
+                textSize = 17f
+                gravity = Gravity.CENTER
+                setTextColor(pal.muted)
+            }, LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.WRAP_CONTENT))
+            r.addView(TextView(this).apply {
+                text = label
+                textSize = 15.5f
+                setTextColor(pal.text)
+                setPadding(dp(14), 0, 0, 0)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (checked != null) {
+                r.addView(CheckBox(this).apply {
+                    isChecked = checked
+                    isClickable = false
+                    isFocusable = false
+                    buttonTintList = ColorStateList.valueOf(ContextCompat.getColor(this@MainActivity, R.color.brand))
+                })
+            }
+            box.addView(r)
+        }
+
+        divider()
+        item("＋", "नया टैब") { newTab(prefs.homeUrl(), false) }
+        item("🕶", "नया इनकॉग्निटो टैब") { newTab(prefs.homeUrl(), true) }
+        item("▦", "टैब को ग्रुप में जोड़ें") { addToGroupDialog(current) }
+        divider()
+        item("🕘", "इतिहास") { showList("इतिहास", "history") }
+        item("🗑", "ब्राउज़िंग डेटा हटाएँ") { clearData() }
+        divider()
+        item("⤓", "डाउनलोड") { openDownloads() }
+        item("★", "बुकमार्क") { showList("बुकमार्क", "bookmarks") }
+        item("🗗", "हाल के टैब") { recentTabs() }
+        divider()
+        item("↗", "शेयर करें") { share() }
+        item("🔍", "पेज में खोजें") { openFind() }
+        item("文", "अनुवाद करें") { translate() }
+        item("📖", "रीडिंग मोड") { readingMode() }
+        item("🖥", "डेस्कटॉप साइट", t?.desktop == true) { toggleDesktop() }
+        item("📲", "होम स्क्रीन पर जोड़ें") { addShortcut() }
+        divider()
+        item("⚙", "सेटिंग्स") { showSettings() }
+        item("🏠", "नया टैब पेज बदलें") { newTabPageDialog() }
+        item("❓", "सहायता और फ़ीडबैक") { helpDialog() }
+
+        val scroll = ScrollView(this).apply { addView(box) }
+        box.measure(View.MeasureSpec.makeMeasureSpec(dp(280), View.MeasureSpec.EXACTLY), View.MeasureSpec.UNSPECIFIED)
+        val maxH = resources.displayMetrics.heightPixels - dp(90)
+        pop.contentView = scroll
+        pop.width = dp(280)
+        pop.height = minOf(box.measuredHeight, maxH)
+        pop.isFocusable = true
+        pop.isOutsideTouchable = true
+        pop.setBackgroundDrawable(rounded(pal.card, dp(14).toFloat()))
+        pop.elevation = dp(10).toFloat()
+        pop.setOnDismissListener { menuPopup = null }
+        menuPopup = pop
+        pop.showAsDropDown(anchor, -dp(4), -anchor.height, Gravity.END)
     }
 
     private fun pageUrl(): String? = current?.web?.url?.takeIf { it.startsWith("http") }
 
-    private fun addBookmark() {
+    private fun toggleBookmark() {
         val w = current?.web ?: return
         val url = pageUrl() ?: run { toast("यह पेज बुकमार्क नहीं हो सकता"); return }
-        prefs.addEntry("bookmarks", w.title ?: url, url, 1000)
-        toast("बुकमार्क जोड़ दिया ★")
+        val list = prefs.list("bookmarks")
+        if (list.any { it.url == url }) {
+            list.removeAll { it.url == url }
+            prefs.saveList("bookmarks", list)
+            toast("बुकमार्क हटा दिया")
+        } else {
+            prefs.addEntry("bookmarks", w.title ?: url, url, 1000)
+            toast("बुकमार्क जोड़ दिया ★")
+        }
+    }
+
+    private fun openDownloads() {
+        try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) } catch (e: Exception) { toast("डाउनलोड फ़ोल्डर नहीं खुल पाया") }
     }
 
     private fun showList(title: String, key: String) {
@@ -582,7 +1022,7 @@ class MainActivity : AppCompatActivity() {
         val labels = list.map { "${it.title}\n${it.url}" }.toTypedArray()
         val d = AlertDialog.Builder(this)
             .setTitle("$title — हटाने के लिए देर तक दबाएँ")
-            .setItems(labels) { _, i -> current?.web?.loadUrl(list[i].url) }
+            .setItems(labels) { _, i -> openUrl(list[i].url) }
             .setNeutralButton("सब हटाएँ") { _, _ -> prefs.saveList(key, emptyList()); toast("सब हटा दिया") }
             .setNegativeButton("बंद करें", null)
             .create()
@@ -598,7 +1038,34 @@ class MainActivity : AppCompatActivity() {
         d.show()
     }
 
+    private fun openUrl(url: String) {
+        val w = current?.web
+        if (w == null) newTab(url, false) else w.loadUrl(url)
+    }
+
+    private fun recentTabs() {
+        val closed = prefs.list("closed")
+        if (closed.isEmpty()) { toast("हाल में कोई टैब बंद नहीं किया गया"); return }
+        val labels = closed.map { "${it.title}\n${it.url}" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("हाल ही में बंद किए गए टैब")
+            .setItems(labels) { _, i ->
+                val e = closed.removeAt(i)
+                prefs.saveList("closed", closed)
+                newTab(e.url, false)
+            }
+            .setPositiveButton("सब फिर खोलें") { _, _ ->
+                closed.drop(1).reversed().forEach { newTab(it.url, false, select = false) }
+                newTab(closed.first().url, false)
+                prefs.saveList("closed", emptyList())
+            }
+            .setNeutralButton("सूची साफ़ करें") { _, _ -> prefs.saveList("closed", emptyList()) }
+            .setNegativeButton("बंद करें", null)
+            .show()
+    }
+
     private fun openFind() {
+        if (current?.web == null) return
         findBar.visibility = View.VISIBLE
         findInput.requestFocus()
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(findInput, InputMethodManager.SHOW_IMPLICIT)
@@ -611,17 +1078,30 @@ class MainActivity : AppCompatActivity() {
         hideKeyboard(findInput)
     }
 
-    private fun share() {
-        val url = pageUrl() ?: return
+    fun shareUrl(url: String, title: String) {
+        if (!url.startsWith("http")) { toast("यह पेज शेयर नहीं हो सकता"); return }
         val i = Intent(Intent.ACTION_SEND).setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, current?.web?.title ?: "")
+            .putExtra(Intent.EXTRA_SUBJECT, title)
             .putExtra(Intent.EXTRA_TEXT, url)
         startActivity(Intent.createChooser(i, "शेयर करें"))
     }
 
+    private fun share() {
+        val url = pageUrl() ?: run { toast("यह पेज शेयर नहीं हो सकता"); return }
+        shareUrl(url, current?.web?.title ?: "")
+    }
+
     private fun translate() {
         val url = pageUrl() ?: run { toast("इस पेज का अनुवाद नहीं हो सकता"); return }
-        current?.web?.loadUrl("https://translate.google.com/translate?sl=auto&tl=hi&u=" + URLEncoder.encode(url, "UTF-8"))
+        val names = arrayOf("हिंदी", "अंग्रेज़ी (English)", "पंजाबी", "बंगाली", "उर्दू", "मराठी")
+        val codes = arrayOf("hi", "en", "pa", "bn", "ur", "mr")
+        AlertDialog.Builder(this)
+            .setTitle("किस भाषा में अनुवाद करें?")
+            .setItems(names) { _, i ->
+                current?.web?.loadUrl("https://translate.google.com/translate?sl=auto&tl=${codes[i]}&u=" + URLEncoder.encode(url, "UTF-8"))
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
     }
 
     private fun readingMode() {
@@ -645,11 +1125,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun toggleDesktop() {
         val t = current ?: return
+        val w = t.web ?: return
         t.desktop = !t.desktop
-        t.web.settings.userAgentString = if (t.desktop) DESKTOP_UA else null
-        t.web.settings.useWideViewPort = true
-        t.web.settings.loadWithOverviewMode = true
-        t.web.reload()
+        w.settings.userAgentString = if (t.desktop) DESKTOP_UA else null
+        w.settings.useWideViewPort = true
+        w.settings.loadWithOverviewMode = true
+        w.reload()
+        saveState()
         toast(if (t.desktop) "डेस्कटॉप साइट चालू" else "मोबाइल साइट चालू")
     }
 
@@ -668,29 +1150,132 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun clearData() {
-        val opts = arrayOf("इतिहास", "कैश की गई फ़ाइलें", "कुकीज़ और साइट डेटा", "बुकमार्क")
-        val checked = booleanArrayOf(true, true, false, false)
+        val ranges = arrayOf("पिछला 1 घंटा", "पिछले 24 घंटे", "पिछले 7 दिन", "पिछले 4 हफ़्ते", "हर समय")
+        val spans = longArrayOf(3600_000L, 86400_000L, 7 * 86400_000L, 28 * 86400_000L, Long.MAX_VALUE)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+        box.addView(TextView(this).apply { text = "समय सीमा"; textSize = 14f; setTypeface(typeface, Typeface.BOLD) })
+        val spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, ranges)
+            setSelection(1)
+        }
+        box.addView(spinner)
+        val cHistory = CheckBox(this).apply { text = "ब्राउज़िंग इतिहास"; isChecked = true }
+        val cCookies = CheckBox(this).apply { text = "कुकीज़ और साइट डेटा\n(ज़्यादातर साइटों से साइन आउट हो जाएँगे)"; isChecked = true }
+        val cCache = CheckBox(this).apply { text = "कैश की गई इमेज और फ़ाइलें"; isChecked = true }
+        val cBook = CheckBox(this).apply { text = "बुकमार्क"; isChecked = false }
+        listOf(cHistory, cCookies, cCache, cBook).forEach { box.addView(it) }
+        box.addView(TextView(this).apply {
+            text = "ध्यान दें: कुकीज़ और कैश समय सीमा चाहे जो हो, पूरे हटते हैं (Android WebView में समय के हिसाब से हटाने की सुविधा नहीं है)।"
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, dp(6), 0, dp(4))
+        })
         AlertDialog.Builder(this)
             .setTitle("ब्राउज़िंग डेटा हटाएँ")
-            .setMultiChoiceItems(opts, checked) { _, i, c -> checked[i] = c }
-            .setPositiveButton("हटाएँ") { _, _ ->
-                if (checked[0]) { prefs.saveList("history", emptyList()); tabs.forEach { it.web.clearHistory() } }
-                if (checked[1]) current?.web?.clearCache(true)
-                if (checked[2]) { CookieManager.getInstance().removeAllCookies(null); WebStorage.getInstance().deleteAllData() }
-                if (checked[3]) prefs.saveList("bookmarks", emptyList())
-                toast("डेटा हटा दिया गया")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("डेटा हटाएँ") { _, _ ->
+                val span = spans[spinner.selectedItemPosition.coerceIn(0, spans.size - 1)]
+                val cutoff = if (span == Long.MAX_VALUE) 0L else System.currentTimeMillis() - span
+                if (cHistory.isChecked) {
+                    prefs.removeSince("history", cutoff)
+                    prefs.removeSince("closed", cutoff)
+                    if (cutoff == 0L) tabs.forEach { it.web?.clearHistory() }
+                }
+                if (cCookies.isChecked) {
+                    CookieManager.getInstance().removeAllCookies(null)
+                    CookieManager.getInstance().flush()
+                    WebStorage.getInstance().deleteAllData()
+                }
+                if (cCache.isChecked) {
+                    (current?.web ?: tabs.firstNotNullOfOrNull { it.web })?.clearCache(true)
+                    cacheDir.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
+                }
+                if (cBook.isChecked) prefs.removeSince("bookmarks", cutoff)
+                toast("${ranges[spinner.selectedItemPosition]} का डेटा हटा दिया गया")
             }
             .setNegativeButton("रद्द करें", null)
             .show()
     }
 
+    private fun newTabPageDialog() {
+        val names = arrayOf("दिशा होम (डिफ़ॉल्ट)", "Google", "खाली पेज", "अपना पेज (वेब पता)")
+        val keys = arrayOf("disha", "google", "blank", "custom")
+        AlertDialog.Builder(this)
+            .setTitle("नया टैब पेज")
+            .setSingleChoiceItems(names, keys.indexOf(prefs.home).coerceAtLeast(0)) { d, i ->
+                d.dismiss()
+                if (keys[i] == "custom") {
+                    val input = EditText(this).apply {
+                        hint = "https://…"
+                        isSingleLine = true
+                        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                        setText(prefs.homeCustom)
+                    }
+                    AlertDialog.Builder(this)
+                        .setTitle("नए टैब में कौन सा पेज खुले?")
+                        .setView(FrameLayout(this).apply { setPadding(dp(22), dp(8), dp(22), 0); addView(input) })
+                        .setPositiveButton("सेव करें") { _, _ ->
+                            val u = toUrl(input.text.toString())
+                            prefs.homeCustom = u
+                            prefs.home = "custom"
+                            toast("नया टैब पेज बदल दिया")
+                        }
+                        .setNegativeButton("रद्द करें", null)
+                        .show()
+                } else {
+                    prefs.home = keys[i]
+                    toast("नया टैब पेज: ${names[i]}")
+                }
+            }
+            .setNegativeButton("बंद करें", null)
+            .show()
+    }
+
+    private fun helpDialog() {
+        val items = arrayOf("ब्राउज़र कैसे इस्तेमाल करें", "फ़ीडबैक भेजें / समस्या बताएँ", "अपडेट जाँचें", "आज की ताज़ा ख़बरें", "ऐप के बारे में")
+        AlertDialog.Builder(this)
+            .setTitle("सहायता और फ़ीडबैक")
+            .setItems(items) { _, i ->
+                when (i) {
+                    0 -> AlertDialog.Builder(this).setTitle("मदद")
+                        .setMessage(
+                            "• ऊपर पता-बार में कुछ भी लिखें या 🎤 दबाकर बोलें।\n" +
+                            "• टैब बटन (चौकोर अंक) से सारे टैब ग्रिड में दिखते हैं — ऊपर “टैब खोजें”, बीच में सामान्य / 🕶 इनकॉग्निटो / ▦ ग्रुप।\n" +
+                            "• टैब कार्ड को देर तक दबाकर उसे ग्रुप में जोड़ें। ग्रुप का नाम, रंग ⋮ से बदलें।\n" +
+                            "• ⋮ मेनू में ऊपर पीछे, आगे, ☆ बुकमार्क, ⤓ पेज डाउनलोड और ⟳ रीफ़्रेश।\n" +
+                            "• पेज में खोजें, अनुवाद, डेस्कटॉप साइट, होम स्क्रीन शॉर्टकट भी ⋮ मेनू में हैं।\n" +
+                            "• नीचे खींचकर (pull down) पेज रीफ़्रेश करें।")
+                        .setPositiveButton("ठीक है", null).show()
+                    1 -> newTab("https://github.com/${Updates.REPO}/issues/new", false)
+                    2 -> checkUpdate()
+                    3 -> newTab(News.PAGE, false)
+                    4 -> about()
+                }
+            }
+            .setNegativeButton("बंद करें", null)
+            .show()
+    }
+
+    private fun about() {
+        AlertDialog.Builder(this).setTitle("दिशा ब्राउज़र")
+            .setMessage("वर्ज़न ${BuildConfig.VERSION_NAME}\n\nतेज़, सुरक्षित और हिंदी में बना ब्राउज़र।\nChrome जैसा टैब ग्रिड, टैब ग्रुप, इनकॉग्निटो, बुकमार्क, इतिहास, डाउनलोड, विज्ञापन ब्लॉकर, रीडिंग मोड, अनुवाद, वॉइस सर्च, डेस्कटॉप साइट, डार्क मोड और रोज़ाना ख़बरें।")
+            .setPositiveButton("ठीक है", null).show()
+    }
+
     private fun onOff(b: Boolean) = if (b) "चालू" else "बंद"
 
-    private fun showSettings() {
+    private fun homeName(): String = when (prefs.home) {
+        "google" -> "Google"
+        "blank" -> "खाली पेज"
+        "custom" -> "अपना पेज"
+        else -> "दिशा होम"
+    }
+
+    fun showSettings() {
         val themes = arrayOf("सिस्टम जैसा", "लाइट", "डार्क")
         val items = arrayOf(
             "डिफ़ॉल्ट सर्च इंजन: ${Engines.list[prefs.engine]}",
-            "होम पेज: ${if (prefs.home == "google") "Google" else "दिशा होम"}",
+            "नया टैब / होम पेज: ${homeName()}",
             "JavaScript: ${onOff(prefs.javascript)}",
             "विज्ञापन ब्लॉकर: ${onOff(prefs.adBlock)}",
             "रोज़ाना ख़बर व अपडेट नोटिफिकेशन: ${onOff(prefs.notifications)}",
@@ -710,10 +1295,10 @@ class MainActivity : AppCompatActivity() {
                                 prefs.engine = keys[w]; d.dismiss(); showSettings()
                             }.show()
                     }
-                    1 -> { prefs.home = if (prefs.home == "google") "disha" else "google"; showSettings() }
+                    1 -> newTabPageDialog()
                     2 -> {
                         prefs.javascript = !prefs.javascript
-                        tabs.forEach { it.web.settings.javaScriptEnabled = prefs.javascript }
+                        tabs.forEach { it.web?.settings?.javaScriptEnabled = prefs.javascript }
                         showSettings()
                     }
                     3 -> { prefs.adBlock = !prefs.adBlock; adBlockOn = prefs.adBlock; showSettings() }
@@ -726,7 +1311,7 @@ class MainActivity : AppCompatActivity() {
                         .setSingleChoiceItems(themes, prefs.night) { d, w ->
                             d.dismiss()
                             prefs.night = w
-                            prefs.saveTabs(tabs.filter { !it.incognito }.mapNotNull { it.web.url })
+                            saveState()
                             prefs.applyNightMode()
                         }.show()
                     6 -> {
@@ -734,16 +1319,14 @@ class MainActivity : AppCompatActivity() {
                         AlertDialog.Builder(this).setTitle("टेक्स्ट साइज़")
                             .setSingleChoiceItems(sizes.map { "$it%" }.toTypedArray(), sizes.indexOf(prefs.textZoom)) { d, w ->
                                 prefs.textZoom = sizes[w]
-                                tabs.forEach { it.web.settings.textZoom = sizes[w] }
+                                tabs.forEach { it.web?.settings?.textZoom = sizes[w] }
                                 d.dismiss()
                             }.show()
                     }
                     7 -> try {
                         startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
                     } catch (e: Exception) { toast("सेटिंग्स नहीं खुल पाईं") }
-                    8 -> AlertDialog.Builder(this).setTitle("दिशा ब्राउज़र")
-                        .setMessage("वर्ज़न ${BuildConfig.VERSION_NAME}\n\nतेज़, सुरक्षित और हिंदी में बना ब्राउज़र।\nटैब, इनकॉग्निटो, बुकमार्क, इतिहास, डाउनलोड, विज्ञापन ब्लॉकर, रीडिंग मोड, अनुवाद, वॉइस सर्च, डेस्कटॉप साइट, डार्क मोड और रोज़ाना ख़बरें।")
-                        .setPositiveButton("ठीक है", null).show()
+                    8 -> about()
                 }
             }
             .setNegativeButton("बंद करें", null)
@@ -759,8 +1342,8 @@ class MainActivity : AppCompatActivity() {
                     r == null -> toast("अभी अपडेट की जानकारी नहीं मिली")
                     r.first > BuildConfig.VERSION_CODE -> AlertDialog.Builder(this)
                         .setTitle("नया वर्ज़न उपलब्ध है")
-                        .setMessage("v1.0.${r.first} आ गया है। अभी डाउनलोड करें?")
-                        .setPositiveButton("डाउनलोड") { _, _ -> current?.web?.loadUrl(r.second) }
+                        .setMessage("v${Updates.versionName(r.first)} आ गया है। अभी डाउनलोड करें?")
+                        .setPositiveButton("डाउनलोड") { _, _ -> openUrl(r.second) }
                         .setNegativeButton("बाद में", null).show()
                     else -> toast("आप सबसे नया वर्ज़न इस्तेमाल कर रहे हैं ✓")
                 }
@@ -770,14 +1353,60 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- Downloads ----------------
 
-    private fun download(url: String, ua: String?, cd: String?, mime: String?) {
-        if (url.startsWith("blob:") || url.startsWith("data:")) { toast("यह फ़ाइल सीधे डाउनलोड नहीं हो सकती"); return }
+    private fun needsStoragePermission(): Boolean {
         if (Build.VERSION.SDK_INT < 29 &&
             checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
             permLauncher.launch(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE))
             toast("अनुमति देकर फिर से डाउनलोड करें")
-            return
+            return true
         }
+        return false
+    }
+
+    /** Saves the current page (MHTML) into the phone's Downloads folder. */
+    private fun downloadPage() {
+        val w = current?.web ?: return
+        if (pageUrl() == null) { toast("यह पेज डाउनलोड नहीं हो सकता"); return }
+        if (needsStoragePermission()) return
+        val base = (w.title ?: "page").replace(Regex("[\\\\/:*?\"<>|\\n\\r]"), "_").trim().take(60).ifBlank { "page" }
+        val name = "$base.mht"
+        val tmp = File(cacheDir, "page_${System.currentTimeMillis()}.mht")
+        toast("पेज डाउनलोड हो रहा है…")
+        w.saveWebArchive(tmp.absolutePath, false) { path ->
+            if (path == null || !tmp.exists()) { toast("पेज डाउनलोड नहीं हो पाया"); return@saveWebArchive }
+            thread {
+                val ok = runCatching { copyToDownloads(tmp, name, "multipart/related") }.getOrDefault(false)
+                tmp.delete()
+                runOnUiThread { toast(if (ok) "पेज डाउनलोड हो गया: $name" else "पेज डाउनलोड नहीं हो पाया") }
+            }
+        }
+    }
+
+    private fun copyToDownloads(src: File, name: String, mime: String): Boolean {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val v = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: return false
+            contentResolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } } ?: return false
+            v.clear()
+            v.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            contentResolver.update(uri, v, null, null)
+            return true
+        }
+        @Suppress("DEPRECATION")
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        dir.mkdirs()
+        src.copyTo(File(dir, name), overwrite = true)
+        return true
+    }
+
+    private fun download(url: String, ua: String?, cd: String?, mime: String?) {
+        if (url.startsWith("blob:") || url.startsWith("data:")) { toast("यह फ़ाइल सीधे डाउनलोड नहीं हो सकती"); return }
+        if (needsStoragePermission()) return
         try {
             val name = URLUtil.guessFileName(url, cd, mime)
             val req = DownloadManager.Request(Uri.parse(url)).apply {

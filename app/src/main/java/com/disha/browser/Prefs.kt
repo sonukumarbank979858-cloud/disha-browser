@@ -39,7 +39,16 @@ class Prefs(ctx: Context) {
         get() = p.getInt("zoom", 100)
         set(v) { p.edit().putInt("zoom", v).apply() }
 
-    fun homeUrl(): String = if (home == "google") "https://www.google.com/" else HOME
+    var homeCustom: String
+        get() = p.getString("home_custom", "") ?: ""
+        set(v) { p.edit().putString("home_custom", v).apply() }
+
+    fun homeUrl(): String = when (home) {
+        "google" -> "https://www.google.com/"
+        "blank" -> "about:blank"
+        "custom" -> homeCustom.ifBlank { HOME }
+        else -> HOME
+    }
 
     fun applyNightMode() {
         AppCompatDelegate.setDefaultNightMode(
@@ -73,6 +82,12 @@ class Prefs(ctx: Context) {
         l.add(0, Entry(title.ifBlank { url }, url, System.currentTimeMillis()))
         while (l.size > max) l.removeAt(l.size - 1)
         saveList(key, l)
+    }
+
+    /** Removes entries saved at or after [cutoff] (0 = everything). */
+    fun removeSince(key: String, cutoff: Long) {
+        if (cutoff <= 0L) { saveList(key, emptyList()); return }
+        saveList(key, list(key).filter { it.time < cutoff })
     }
 
     fun savedTabs(): List<String> {

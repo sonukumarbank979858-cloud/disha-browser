@@ -33,7 +33,7 @@ jobs:
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/release/app-release.apk "DishaBrowser-v1.0.${{ github.run_number }}.apk"
+        run: cp app/build/outputs/apk/release/app-release.apk "DishaBrowser-v1.1.${{ github.run_number }}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -44,6 +44,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
-          name: Disha Browser v1.0.${{ github.run_number }}
+          name: Disha Browser v1.1.${{ github.run_number }}
           body: "दिशा ब्राउज़र का नया वर्ज़न। नीचे दी गई APK फ़ाइल डाउनलोड करके इंस्टॉल करें।"
           files: DishaBrowser-v*.apk
