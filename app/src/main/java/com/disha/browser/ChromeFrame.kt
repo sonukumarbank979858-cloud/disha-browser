@@ -7,23 +7,24 @@ import android.view.View
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import kotlin.math.max
-import kotlin.math.min
 
 /**
- * Chrome-style hide-on-scroll layout for the top toolbar.
+ * Chrome-style hide-on-scroll layout for the top toolbar (v1.1.5 rewrite).
  *
- * It holds exactly two children: [content] (the web pages) and [header] (address bar, progress,
- * find bar), drawn on top. [offset] is how far the header has slid up: 0 = fully shown,
- * header height = fully hidden. Both children move with translationY only, so following the
- * finger never re-lays-out the WebView.
+ * Two children: [content] (the web pages) and [header] (address bar, progress, find bar) on top.
+ * The header is either shown or hidden; a scroll never drags it half way any more. Moving between
+ * the two is a short animation of translationY only, so the WebView is never re-laid-out per frame.
  *
- * The content is resized only twice per hide/show cycle, never per frame:
- *  - while the header is fully shown and at rest, the content is (height - header) tall;
- *  - as soon as the header starts moving, or while it is hidden, the content is the full height,
- *    so no blank gap can ever open at the bottom (only a temporary bit of the page bottom is
- *    clipped while the header is half way).
- * [growStamp] tells the activity when the content just grew, so the scroll clamp that a resize
- * can cause near the end of a page is not mistaken for a user scroll (that caused jitter).
+ * Why (v1.1.4 bug, "scroll up par hang / page khud uchhal raha hai"): the old version made the
+ * header and the WebView follow every scroll pixel. Moving the WebView under the finger changes the
+ * finger's position inside it, which changes the next scroll delta, which moves the WebView again
+ * (a feedback loop = bouncing), and every start/stop of that movement resized the WebView.
+ *
+ * The content is resized at most twice per hide/show cycle and never during a touch:
+ *  - header shown, at rest and the page idle ([holdFull] false): content is (height - header) tall;
+ *  - otherwise: content is the full height (only the bottom strip is temporarily below the screen).
+ * [layoutStamp] tells the activity when the content was just resized, so scroll changes the page
+ * makes in reaction to that (reflow, scroll clamp) are never taken as the user scrolling.
  */
 class ChromeFrame(ctx: Context) : FrameLayout(ctx) {
 
@@ -33,12 +34,27 @@ class ChromeFrame(ctx: Context) : FrameLayout(ctx) {
     var offset = 0f
         private set
     private var settled = true
-    private var lastDir = 0
     private var anim: ValueAnimator? = null
+    private var hiddenTarget = false
+
+    /** Hide-on-scroll switched on (Settings). When off the toolbar is always shown. */
+    var enabledHide = true
+        set(v) { field = v; if (!v) show(false) }
+
     /** While true the header stays fully shown (address bar typing, find in page, menu). */
     var lockShown = false
         set(v) { field = v; if (v) show(false) }
-    var growStamp = 0L
+
+    /** While true (finger on the page / fling) the content keeps its size; resized when released. */
+    var holdFull = false
+        set(v) {
+            if (field == v) return
+            val was = contentFull()
+            field = v
+            if (contentFull() != was) resized()
+        }
+
+    var layoutStamp = 0L
         private set
 
     fun setup(content: View, header: View) {
@@ -50,7 +66,13 @@ class ChromeFrame(ctx: Context) : FrameLayout(ctx) {
 
     private fun headerH(): Int = header.measuredHeight
 
-    private fun contentFull(): Boolean = !(settled && offset <= 0f)
+    private fun contentFull(): Boolean = !(settled && offset <= 0f && !holdFull)
+
+    val isContentFull: Boolean get() = contentFull()
+    val isFullyShown: Boolean get() = offset <= 0f && !hiddenTarget
+    val isHidden: Boolean get() = hiddenTarget
+    val isAnimating: Boolean get() = anim != null
+    fun headerHeight(): Int = headerH()
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val w = MeasureSpec.getSize(widthMeasureSpec)
@@ -59,6 +81,7 @@ class ChromeFrame(ctx: Context) : FrameLayout(ctx) {
             MeasureSpec.makeMeasureSpec(h, MeasureSpec.AT_MOST))
         val hh = headerH()
         if (offset > hh) offset = hh.toFloat()
+        if (hiddenTarget && settled && anim == null) offset = hh.toFloat()
         val ch = if (contentFull()) h else max(0, h - hh)
         content.measure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
             MeasureSpec.makeMeasureSpec(ch, MeasureSpec.EXACTLY))
@@ -78,55 +101,48 @@ class ChromeFrame(ctx: Context) : FrameLayout(ctx) {
         content.translationY = -offset
     }
 
+    private fun resized() {
+        layoutStamp = SystemClock.uptimeMillis()
+        requestLayout()
+    }
+
     private fun setOffset(o: Float, rest: Boolean) {
         val wasFull = contentFull()
         offset = o
         settled = rest
-        val full = contentFull()
-        if (full != wasFull) {
-            if (full) growStamp = SystemClock.uptimeMillis()
-            requestLayout()
-        }
+        if (contentFull() != wasFull) resized()
         applyTranslation()
     }
 
-    /** Page scrolled by [dy] pixels (positive = content moved up / user scrolled down). */
-    fun scrollBy(dy: Float) {
-        if (dy == 0f) return
-        if (lockShown && dy > 0) return
+    fun hide() {
+        if (!enabledHide || lockShown || hiddenTarget) return
         val hh = headerH().toFloat()
-        if (hh <= 0f) return
-        anim?.cancel(); anim = null
-        lastDir = if (dy > 0) 1 else -1
-        val n = min(hh, max(0f, offset + dy))
-        if (n != offset || settled) setOffset(n, false)
-    }
-
-    /** Finish a half-way header in the direction the user last scrolled. */
-    fun snap() {
-        if (anim != null) return
-        val hh = headerH().toFloat()
-        when {
-            offset <= 0f -> setOffset(0f, true)
-            offset >= hh -> setOffset(hh, true)
-            else -> animateTo(if (lastDir > 0 && !lockShown) hh else 0f)
-        }
+        if (hh <= 0f || !isLaidOut) return
+        hiddenTarget = true
+        animateTo(hh)
     }
 
     fun show(animate: Boolean) {
-        if (offset <= 0f && settled) return
-        if (animate && isLaidOut) animateTo(0f) else { anim?.cancel(); anim = null; setOffset(0f, true) }
+        val wasHidden = hiddenTarget
+        hiddenTarget = false
+        if (offset <= 0f && settled && anim == null) return
+        if (!wasHidden && anim != null) return          // already sliding back in
+        if (animate && isLaidOut && wasHidden) animateTo(0f)
+        else { anim?.cancel(); anim = null; setOffset(0f, true) }
     }
 
-    val isFullyShown: Boolean get() = offset <= 0f
-
     private fun animateTo(target: Float) {
-        anim?.cancel()
+        anim?.cancel(); anim = null
         if (offset == target) { setOffset(target, true); return }
+        // grow the content once, before the movement starts (never during it)
+        setOffset(offset, false)
         anim = ValueAnimator.ofFloat(offset, target).apply {
             duration = 180
             interpolator = DecelerateInterpolator()
-            addUpdateListener { setOffset(it.animatedValue as Float, false) }
+            addUpdateListener {
+                offset = it.animatedValue as Float
+                applyTranslation()
+            }
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 private var cancelled = false
                 override fun onAnimationCancel(a: android.animation.Animator) { cancelled = true }

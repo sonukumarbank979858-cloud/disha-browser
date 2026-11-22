@@ -118,7 +118,11 @@ class MainActivity : AppCompatActivity() {
     private var lastTouchUp = 0L
     private var touchDownY = 0f
     private var lastInnerScroll = 0L
-    private val snapRunnable = Runnable { if (::root.isInitialized && !touching) root.snap() }
+    private var scrollAcc = 0f                 // scroll in one direction since the last turn
+    private val innerTop = java.util.WeakHashMap<WebView, Boolean>()   // page's own scroll box at its top
+    private val innerAtTop: Boolean get() = current?.web?.let { innerTop[it] } ?: true
+    private val releaseRunnable = Runnable { if (::root.isInitialized && !touching) root.holdFull = false }
+    private val captureRunnable = Runnable { current?.let { if (!switcher.isShowing) capture(it) } }
 
     @Volatile private var adBlockOn = true
     private var fullscreenView: View? = null
@@ -380,7 +384,15 @@ class MainActivity : AppCompatActivity() {
             addView(container, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             setColorSchemeColors(ContextCompat.getColor(this@MainActivity, R.color.brand))
             setOnRefreshListener { current?.web?.reload() }
-            setOnChildScrollUpCallback { _, _ -> (current?.web?.scrollY ?: 0) > 0 }
+            // Pull-to-refresh only when the page really is at its top: the page itself AND the
+            // page's own scroll box (sites that scroll inside a div keep scrollY at 0, which made
+            // scrolling up on them start a refresh = page jumping / hanging).
+            setOnChildScrollUpCallback { _, _ ->
+                val w = current?.web
+                w == null || w.scrollY > 0 || w.canScrollVertically(-1) || !innerAtTop ||
+                    SystemClock.uptimeMillis() - lastInnerScroll < 400
+            }
+            setDistanceToTriggerSync(dp(140))
         }
 
         // The progress line sits over the bottom edge of the toolbar, so showing or hiding it
@@ -392,6 +404,7 @@ class MainActivity : AppCompatActivity() {
         header.addView(findBar)
         header.isClickable = true   // touches on the toolbar never fall through to the page
         root.setup(swipe, header)
+        root.enabledHide = prefs.hideToolbar
         urlBar.setOnFocusChangeListener { _, has -> updateToolbarLock(); if (has) root.show(true) }
 
         val frame = FrameLayout(this)
@@ -483,20 +496,45 @@ class MainActivity : AppCompatActivity() {
     /** A finger on the page (or the fling right after it) — programmatic scrolls do not move the toolbar. */
     private fun userScrolling(): Boolean = touching || SystemClock.uptimeMillis() - lastTouchUp < 2500
 
-    private fun scheduleSnap() {
-        main.removeCallbacks(snapRunnable)
-        if (!touching) main.postDelayed(snapRunnable, 140)
+    /** Scroll changes caused by our own toolbar animation / resize are never user scrolls. */
+    private fun ownLayoutChange(): Boolean =
+        root.isAnimating || SystemClock.uptimeMillis() - root.layoutStamp < 350
+
+    private fun toolbarActive(w: WebView): Boolean =
+        w == current?.web && !switcher.isShowing && fullscreenView == null && root.enabledHide
+
+    /**
+     * Direction with hysteresis: the toolbar only turns after [TURN_DP] of scrolling in one
+     * direction, and only once per turn (no per-pixel following, no per-frame layout).
+     */
+    private fun onScrollDelta(dyPx: Float, w: WebView) {
+        if (ownLayoutChange() || !userScrolling()) { scrollAcc = 0f; return }
+        if (dyPx == 0f) return
+        if ((dyPx > 0) != (scrollAcc > 0)) scrollAcc = 0f
+        scrollAcc += dyPx
+        val turn = dp(TURN_DP).toFloat()
+        if (scrollAcc >= turn) {
+            scrollAcc = 0f
+            if (!root.isHidden && roomBelow(w)) root.hide()
+        } else if (scrollAcc <= -turn) {
+            scrollAcc = 0f
+            if (root.isHidden) root.show(true)
+        }
+    }
+
+    /** Hiding grows the page by the toolbar height; near the very end that would clamp (jump) it. */
+    private fun roomBelow(w: WebView): Boolean {
+        if (root.isContentFull) return true
+        @Suppress("DEPRECATION")
+        val total = w.contentHeight * w.scale
+        if (total <= 0f) return true
+        return total - (w.scrollY + w.height) > root.headerHeight()
     }
 
     private fun onPageScrolled(w: WebView, dy: Int, y: Int) {
-        if (w != current?.web || switcher.isShowing || fullscreenView != null) return
-        if (dy == 0) return
-        // a page that just got taller viewport may clamp its scroll a little: not a user scroll
-        if (dy < 0 && SystemClock.uptimeMillis() - root.growStamp < 250 && y > 0) return
-        if (y <= 0) { root.show(true); return }        // reached the top of the page
-        if (!userScrolling()) return
-        root.scrollBy(dy.toFloat())
-        scheduleSnap()
+        if (!toolbarActive(w)) return
+        if (y <= 0) { scrollAcc = 0f; root.show(true); return }      // reached the top of the page
+        onScrollDelta(dy.toFloat(), w)
     }
 
     private fun onWebTouch(w: WebView, e: MotionEvent) {
@@ -504,37 +542,48 @@ class MainActivity : AppCompatActivity() {
             MotionEvent.ACTION_DOWN -> {
                 touching = true
                 touchDownY = e.rawY
-                main.removeCallbacks(snapRunnable)
+                scrollAcc = 0f
+                main.removeCallbacks(releaseRunnable)
+                root.holdFull = true      // no resize of the page while a finger is on it
             }
             MotionEvent.ACTION_MOVE -> {
                 // Finger pulled down on a page that cannot scroll up any more (short page, or a
                 // site that scrolls inside its own box and is at its top): bring the toolbar back.
-                if (e.rawY - touchDownY > dp(24) && !w.canScrollVertically(-1) &&
-                    SystemClock.uptimeMillis() - lastInnerScroll > 300 && !root.isFullyShown) {
+                if (e.rawY - touchDownY > dp(24) && root.isHidden && !w.canScrollVertically(-1) &&
+                    innerAtTop && SystemClock.uptimeMillis() - lastInnerScroll > 300) {
                     root.show(true)
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 touching = false
                 lastTouchUp = SystemClock.uptimeMillis()
-                scheduleSnap()
+                main.removeCallbacks(releaseRunnable)
+                main.postDelayed(releaseRunnable, 300)
             }
         }
     }
 
-    /** Scroll inside a page's own scroll box (e.g. some Google / web-app pages) reported from JS. */
+    /**
+     * Reports from the page's own scroll boxes (e.g. some Google / web-app pages). The JS side is
+     * throttled: it only calls on a direction turn (after [TURN_DP] css px) or a top/not-top change.
+     */
     inner class ScrollBridge(private val w: WebView) {
         @JavascriptInterface
-        fun inner(dyCss: Float, atTop: Boolean) {
+        fun dir(d: Int) {
             main.post {
-                if (w != current?.web || switcher.isShowing || fullscreenView != null) return@post
                 lastInnerScroll = SystemClock.uptimeMillis()
-                if (atTop) { root.show(true); return@post }
-                if (!userScrolling()) return@post
-                @Suppress("DEPRECATION")
-                val px = dyCss * w.scale
-                root.scrollBy(px)
-                scheduleSnap()
+                if (!toolbarActive(w) || ownLayoutChange() || !userScrolling()) return@post
+                if (d > 0) { if (!root.isHidden) root.hide() } else if (root.isHidden) root.show(true)
+            }
+        }
+
+        @JavascriptInterface
+        fun top(atTop: Boolean) {
+            main.post {
+                innerTop[w] = atTop
+                if (w != current?.web) return@post
+                if (!atTop) lastInnerScroll = SystemClock.uptimeMillis()
+                if (atTop && toolbarActive(w)) root.show(true)
             }
         }
     }
@@ -965,7 +1014,8 @@ class MainActivity : AppCompatActivity() {
             val t = tabOf(view)
             if (t != null && url != null) t.url = url
             if (view == current?.web && !urlBar.hasFocus()) urlBar.setText(displayUrl(url))
-            if (view == current?.web) root.show(true)
+            innerTop[view] = true
+            if (view == current?.web) { scrollAcc = 0f; root.show(true) }
         }
 
         override fun onPageCommitVisible(view: WebView, url: String?) {
@@ -984,7 +1034,10 @@ class MainActivity : AppCompatActivity() {
             }
             t.groupId?.let { gid -> groups.firstOrNull { it.id == gid }?.updated = System.currentTimeMillis() }
             if (!t.incognito) saveState()
-            main.postDelayed({ if (current == t && !switcher.isShowing) capture(t) }, 1200)
+            if (view == current?.web) {
+                main.removeCallbacks(captureRunnable)       // SPA pages fire this often: one capture
+                main.postDelayed(captureRunnable, 1200)
+            }
         }
     }
 
@@ -1471,6 +1524,7 @@ class MainActivity : AppCompatActivity() {
             "रोज़ाना ख़बर व अपडेट नोटिफिकेशन: ${onOff(prefs.notifications)}",
             "थीम: ${themes[prefs.night]}",
             "टेक्स्ट साइज़: ${prefs.textZoom}%",
+            "स्क्रॉल करने पर टूलबार छिपाएँ: ${onOff(prefs.hideToolbar)}",
             "दिशा को डिफ़ॉल्ट ब्राउज़र बनाएँ",
             "ऐप के बारे में"
         )
@@ -1513,10 +1567,15 @@ class MainActivity : AppCompatActivity() {
                                 d.dismiss()
                             }.show()
                     }
-                    7 -> try {
+                    7 -> {
+                        prefs.hideToolbar = !prefs.hideToolbar
+                        root.enabledHide = prefs.hideToolbar
+                        showSettings()
+                    }
+                    8 -> try {
                         startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
                     } catch (e: Exception) { toast("सेटिंग्स नहीं खुल पाईं") }
-                    8 -> about()
+                    9 -> about()
                 }
             }
             .setNegativeButton("बंद करें", null)
@@ -1616,17 +1675,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        /** Reports scrolling inside a page's own scroll boxes (not the page itself) to DishaScroll. */
+        const val TURN_DP = 24
+
+        /**
+         * Watches the page's own scroll boxes (not the page itself). Passive listeners, work done
+         * at most once per animation frame, and the bridge is called only when the direction turns
+         * (after 24 css px one way) or the box reaches / leaves its top. Ignores scroll caused by a
+         * window resize (our toolbar) for 350 ms.
+         */
         val SCROLL_JS = """
 (function(){if(window.__dishaSc||!window.DishaScroll)return;window.__dishaSc=1;
-var last=new WeakMap(),acc=0,top=false,raf=0;
-document.addEventListener('scroll',function(e){var t=e.target;
-if(!t||t===document||t===document.documentElement||t===document.body||t.nodeType!==1)return;
-if(t.clientHeight<window.innerHeight*0.5)return;
-var y=t.scrollTop,p=last.has(t)?last.get(t):y;last.set(t,y);var d=y-p;if(!d)return;
-acc+=d;top=y<=0;
-if(!raf)raf=requestAnimationFrame(function(){raf=0;var a=acc;acc=0;try{DishaScroll.inner(a,top)}catch(x){}});
-},{capture:true,passive:true});})();
+var B=window.DishaScroll,last=new WeakMap(),acc=0,sentDir=0,sentTop=true,pend=null,raf=0,quiet=0;
+function now(){return Date.now()}
+function big(t){return t&&t.nodeType===1&&t!==document.documentElement&&t!==document.body&&t.clientHeight>=window.innerHeight*0.5}
+window.addEventListener('resize',function(){quiet=now()+350;acc=0;},{passive:true});
+document.addEventListener('scroll',function(e){var t=e.target;if(!big(t))return;
+var y=t.scrollTop,p=last.has(t)?last.get(t):y;last.set(t,y);pend=t;
+if(now()<quiet){acc=0;return}var d=y-p;if(!d)return;
+if((d>0)!==(acc>0))acc=0;acc+=d;
+if(!raf)raf=requestAnimationFrame(flush);},{capture:true,passive:true});
+function flush(){raf=0;var t=pend;if(!t)return;var top=t.scrollTop<=0;
+if(top!==sentTop){sentTop=top;try{B.top(top)}catch(x){}}
+if(acc>=24&&sentDir!==1){sentDir=1;acc=0;try{B.dir(1)}catch(x){}}
+else if(acc<=-24&&sentDir!==-1){sentDir=-1;acc=0;try{B.dir(-1)}catch(x){}}}
+document.addEventListener('touchstart',function(e){var n=e.target,top=true;
+while(n&&n.nodeType===1&&n!==document.documentElement&&n!==document.body){
+if(n.scrollTop>0&&n.scrollHeight>n.clientHeight){top=false;break}n=n.parentNode}
+sentDir=0;if(top!==sentTop){sentTop=top;try{B.top(top)}catch(x){}}},{capture:true,passive:true});
+})();
 """
         const val DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     }
