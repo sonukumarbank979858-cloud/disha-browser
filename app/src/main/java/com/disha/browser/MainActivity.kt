@@ -76,7 +76,6 @@ import android.webkit.JavascriptInterface
 import android.os.SystemClock
 import android.util.TypedValue
 import androidx.core.widget.doAfterTextChanged
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
@@ -104,7 +103,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tabBtn: TextView
     private lateinit var menuBtn: TextView
     private lateinit var progress: ProgressBar
-    private lateinit var swipe: SwipeRefreshLayout
     private lateinit var container: FrameLayout
     private lateinit var findBar: LinearLayout
     private lateinit var findInput: EditText
@@ -113,16 +111,8 @@ class MainActivity : AppCompatActivity() {
     private var menuPopup: PopupWindow? = null
     private val main = Handler(Looper.getMainLooper())
 
-    // hide-on-scroll state for the top toolbar
-    private var touching = false
-    private var lastTouchUp = 0L
-    private var touchDownY = 0f
-    private var lastInnerScroll = 0L
-    private var scrollAcc = 0f                 // scroll in one direction since the last turn
-    private val innerTop = java.util.WeakHashMap<WebView, Boolean>()   // page's own scroll box at its top
-    private val innerAtTop: Boolean get() = current?.web?.let { innerTop[it] } ?: true
-    private val releaseRunnable = Runnable { if (::root.isInitialized && !touching) root.holdFull = false }
-    private val captureRunnable = Runnable { current?.let { if (!switcher.isShowing) capture(it) } }
+    private var lastNight = false            // night bit of the last applied configuration
+    private var recreating = false
 
     @Volatile private var adBlockOn = true
     private var fullscreenView: View? = null
@@ -152,6 +142,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         store = TabStore(this)
         adBlockOn = prefs.adBlock
+        lastNight = isNight()
         setupSystemBars()
         buildUi()
         Notify.channels(this)
@@ -259,9 +250,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        // Only a real day/night switch rebuilds the screen (views are coloured in code). Keyboard,
+        // rotation, size and density changes never recreate the activity or touch the WebViews.
+        val night = isNight()
+        if (night != lastNight) { lastNight = night; recreateOnce(); return }
         if (fullscreenView == null) setupSystemBars()
-        root.show(false)
         if (switcher.isShowing) switcher.render()
+    }
+
+    private fun recreateOnce() {
+        if (recreating) return
+        recreating = true
+        saveState()
+        recreate()
     }
 
     override fun onDestroy() {
@@ -380,21 +381,6 @@ class MainActivity : AppCompatActivity() {
         findBar.addView(iconButton("✕", "बंद करें") { closeFind() })
 
         container = FrameLayout(this)
-        swipe = SwipeRefreshLayout(this).apply {
-            addView(container, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-            setColorSchemeColors(ContextCompat.getColor(this@MainActivity, R.color.brand))
-            setOnRefreshListener { current?.web?.reload() }
-            // Pull-to-refresh only when the page really is at its top: the page itself AND the
-            // page's own scroll box (sites that scroll inside a div keep scrollY at 0, which made
-            // scrolling up on them start a refresh = page jumping / hanging).
-            setOnChildScrollUpCallback { _, _ ->
-                val w = current?.web
-                w == null || w.scrollY > 0 || w.canScrollVertically(-1) || !innerAtTop ||
-                    SystemClock.uptimeMillis() - lastInnerScroll < 400
-            }
-            setDistanceToTriggerSync(dp(140))
-        }
-
         // The progress line sits over the bottom edge of the toolbar, so showing or hiding it
         // never changes the toolbar height (no jump of the page).
         val topBox = FrameLayout(this)
@@ -403,17 +389,20 @@ class MainActivity : AppCompatActivity() {
         header.addView(topBox)
         header.addView(findBar)
         header.isClickable = true   // touches on the toolbar never fall through to the page
-        root.setup(swipe, header)
-        root.enabledHide = prefs.hideToolbar
-        urlBar.setOnFocusChangeListener { _, has -> updateToolbarLock(); if (has) root.show(true) }
+        root.setup(container, header)
 
         val frame = FrameLayout(this)
         frame.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // Safety net: if the window is ever laid out edge-to-edge (some ROMs / Android 15),
         // keep the browser out of the status bar, navigation bar and display cutout.
+        // Only system bars / cutout here (never the keyboard: adjustResize already shrinks the
+        // window once), and padding is touched only when it really changes, so the keyboard
+        // opening can never start a relayout loop.
         ViewCompat.setOnApplyWindowInsetsListener(frame) { v, insets ->
             val i = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
-            v.setPadding(i.left, i.top, i.right, i.bottom)
+            if (v.paddingLeft != i.left || v.paddingTop != i.top || v.paddingRight != i.right || v.paddingBottom != i.bottom) {
+                v.setPadding(i.left, i.top, i.right, i.bottom)
+            }
             insets
         }
         switcher = TabSwitcher(this)
@@ -438,7 +427,6 @@ class MainActivity : AppCompatActivity() {
     private fun applyToolbarColors() {
         val t = current
         val incog = t?.incognito == true
-        // the toolbar now floats over the page, so it needs a solid background
         header.setBackgroundColor(if (incog) Color.parseColor("#2B2B2B") else themeBackground())
         applyStatusBarColor()
         if (incog) {
@@ -486,111 +474,6 @@ class MainActivity : AppCompatActivity() {
         @Suppress("DEPRECATION")
         window.statusBarColor = if (incog) Color.parseColor("#2B2B2B") else ContextCompat.getColor(this, R.color.brand_dark)
         WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
-    }
-
-    private fun updateToolbarLock() {
-        if (!::root.isInitialized) return
-        root.lockShown = urlBar.hasFocus() || findBar.visibility == View.VISIBLE
-    }
-
-    /** A finger on the page (or the fling right after it) — programmatic scrolls do not move the toolbar. */
-    private fun userScrolling(): Boolean = touching || SystemClock.uptimeMillis() - lastTouchUp < 2500
-
-    /** Scroll changes caused by our own toolbar animation / resize are never user scrolls. */
-    private fun ownLayoutChange(): Boolean =
-        root.isAnimating || SystemClock.uptimeMillis() - root.layoutStamp < 350
-
-    private fun toolbarActive(w: WebView): Boolean =
-        w == current?.web && !switcher.isShowing && fullscreenView == null && root.enabledHide
-
-    /**
-     * Direction with hysteresis: the toolbar only turns after [TURN_DP] of scrolling in one
-     * direction, and only once per turn (no per-pixel following, no per-frame layout).
-     */
-    private fun onScrollDelta(dyPx: Float, w: WebView) {
-        if (ownLayoutChange() || !userScrolling()) { scrollAcc = 0f; return }
-        if (dyPx == 0f) return
-        if ((dyPx > 0) != (scrollAcc > 0)) scrollAcc = 0f
-        scrollAcc += dyPx
-        val turn = dp(TURN_DP).toFloat()
-        if (scrollAcc >= turn) {
-            scrollAcc = 0f
-            if (!root.isHidden && roomBelow(w)) root.hide()
-        } else if (scrollAcc <= -turn) {
-            scrollAcc = 0f
-            if (root.isHidden) root.show(true)
-        }
-    }
-
-    /** Hiding grows the page by the toolbar height; near the very end that would clamp (jump) it. */
-    private fun roomBelow(w: WebView): Boolean {
-        if (root.isContentFull) return true
-        @Suppress("DEPRECATION")
-        val total = w.contentHeight * w.scale
-        if (total <= 0f) return true
-        return total - (w.scrollY + w.height) > root.headerHeight()
-    }
-
-    private fun onPageScrolled(w: WebView, dy: Int, y: Int) {
-        if (!toolbarActive(w)) return
-        if (y <= 0) { scrollAcc = 0f; root.show(true); return }      // reached the top of the page
-        onScrollDelta(dy.toFloat(), w)
-    }
-
-    private fun onWebTouch(w: WebView, e: MotionEvent) {
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                touching = true
-                touchDownY = e.rawY
-                scrollAcc = 0f
-                main.removeCallbacks(releaseRunnable)
-                root.holdFull = true      // no resize of the page while a finger is on it
-            }
-            MotionEvent.ACTION_MOVE -> {
-                // Finger pulled down on a page that cannot scroll up any more (short page, or a
-                // site that scrolls inside its own box and is at its top): bring the toolbar back.
-                if (e.rawY - touchDownY > dp(24) && root.isHidden && !w.canScrollVertically(-1) &&
-                    innerAtTop && SystemClock.uptimeMillis() - lastInnerScroll > 300) {
-                    root.show(true)
-                }
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                touching = false
-                lastTouchUp = SystemClock.uptimeMillis()
-                main.removeCallbacks(releaseRunnable)
-                main.postDelayed(releaseRunnable, 300)
-            }
-        }
-    }
-
-    /**
-     * Reports from the page's own scroll boxes (e.g. some Google / web-app pages). The JS side is
-     * throttled: it only calls on a direction turn (after [TURN_DP] css px) or a top/not-top change.
-     */
-    inner class ScrollBridge(private val w: WebView) {
-        @JavascriptInterface
-        fun dir(d: Int) {
-            main.post {
-                lastInnerScroll = SystemClock.uptimeMillis()
-                if (!toolbarActive(w) || ownLayoutChange() || !userScrolling()) return@post
-                if (d > 0) { if (!root.isHidden) root.hide() } else if (root.isHidden) root.show(true)
-            }
-        }
-
-        @JavascriptInterface
-        fun top(atTop: Boolean) {
-            main.post {
-                innerTop[w] = atTop
-                if (w != current?.web) return@post
-                if (!atTop) lastInnerScroll = SystemClock.uptimeMillis()
-                if (atTop && toolbarActive(w)) root.show(true)
-            }
-        }
-    }
-
-    private fun injectScrollWatcher(w: WebView) {
-        if (!w.settings.javaScriptEnabled) return
-        w.evaluateJavascript(SCROLL_JS, null)
     }
 
     // ---------------- Tabs ----------------
@@ -648,9 +531,6 @@ class MainActivity : AppCompatActivity() {
         w.webViewClient = Client()
         w.webChromeClient = Chrome()
         w.setDownloadListener { url, ua, cd, mime, _ -> download(url, ua, cd, mime) }
-        w.addJavascriptInterface(ScrollBridge(w), "DishaScroll")
-        w.setOnScrollChangeListener { v, _, y, _, oldY -> onPageScrolled(v as WebView, y - oldY, y) }
-        w.setOnTouchListener { v, e -> onWebTouch(v as WebView, e); false }
         w.setFindListener { active, count, _ ->
             findCount.text = if (count == 0) "0/0" else "${active + 1}/$count"
         }
@@ -697,8 +577,6 @@ class MainActivity : AppCompatActivity() {
         if (findBar.visibility == View.VISIBLE) closeFind()
         applyToolbarColors()
         updateTabCount()
-        touching = false
-        root.show(false)
     }
 
     fun closeTab(t: Tab) {
@@ -1014,30 +892,18 @@ class MainActivity : AppCompatActivity() {
             val t = tabOf(view)
             if (t != null && url != null) t.url = url
             if (view == current?.web && !urlBar.hasFocus()) urlBar.setText(displayUrl(url))
-            innerTop[view] = true
-            if (view == current?.web) { scrollAcc = 0f; root.show(true) }
-        }
-
-        override fun onPageCommitVisible(view: WebView, url: String?) {
-            injectScrollWatcher(view)
         }
 
         override fun onPageFinished(view: WebView, url: String?) {
-            swipe.isRefreshing = false
             val t = tabOf(view) ?: return
             if (url != null) t.url = url
             view.title?.let { if (it.isNotBlank()) t.title = it }
             if (view == current?.web && !urlBar.hasFocus()) urlBar.setText(displayUrl(url))
-            injectScrollWatcher(view)
             if (!t.incognito && url != null && url.startsWith("http")) {
                 prefs.addEntry("history", view.title ?: url, url, 500)
             }
             t.groupId?.let { gid -> groups.firstOrNull { it.id == gid }?.updated = System.currentTimeMillis() }
             if (!t.incognito) saveState()
-            if (view == current?.web) {
-                main.removeCallbacks(captureRunnable)       // SPA pages fire this often: one capture
-                main.postDelayed(captureRunnable, 1200)
-            }
         }
     }
 
@@ -1079,7 +945,6 @@ class MainActivity : AppCompatActivity() {
             fullscreenCallback = null
             WindowCompat.getInsetsController(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
             setupSystemBars()
-            root.show(false)
         }
 
         override fun onShowFileChooser(webView: WebView, filePathCallback: ValueCallback<Array<Uri>>, fileChooserParams: FileChooserParams): Boolean {
@@ -1124,7 +989,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMenu(anchor: View) {
         menuPopup?.dismiss()
-        root.show(false)
         val t = current
         val w = t?.web
         val pal = Palette(isNight() || t?.incognito == true)
@@ -1308,7 +1172,6 @@ class MainActivity : AppCompatActivity() {
     private fun openFind() {
         if (current?.web == null) return
         findBar.visibility = View.VISIBLE
-        updateToolbarLock()
         findInput.requestFocus()
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(findInput, InputMethodManager.SHOW_IMPLICIT)
     }
@@ -1318,7 +1181,6 @@ class MainActivity : AppCompatActivity() {
         findInput.setText("")
         findBar.visibility = View.GONE
         hideKeyboard(findInput)
-        updateToolbarLock()
     }
 
     fun shareUrl(url: String, title: String) {
@@ -1524,7 +1386,6 @@ class MainActivity : AppCompatActivity() {
             "रोज़ाना ख़बर व अपडेट नोटिफिकेशन: ${onOff(prefs.notifications)}",
             "थीम: ${themes[prefs.night]}",
             "टेक्स्ट साइज़: ${prefs.textZoom}%",
-            "स्क्रॉल करने पर टूलबार छिपाएँ: ${onOff(prefs.hideToolbar)}",
             "दिशा को डिफ़ॉल्ट ब्राउज़र बनाएँ",
             "ऐप के बारे में"
         )
@@ -1557,6 +1418,8 @@ class MainActivity : AppCompatActivity() {
                             prefs.night = w
                             saveState()
                             prefs.applyNightMode()
+                            // uiMode is handled in the manifest, so rebuild only if the colours changed
+                            main.post { if (isNight() != lastNight) { lastNight = isNight(); recreateOnce() } }
                         }.show()
                     6 -> {
                         val sizes = arrayOf(80, 90, 100, 115, 130, 150, 175)
@@ -1567,15 +1430,10 @@ class MainActivity : AppCompatActivity() {
                                 d.dismiss()
                             }.show()
                     }
-                    7 -> {
-                        prefs.hideToolbar = !prefs.hideToolbar
-                        root.enabledHide = prefs.hideToolbar
-                        showSettings()
-                    }
-                    8 -> try {
+                    7 -> try {
                         startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
                     } catch (e: Exception) { toast("सेटिंग्स नहीं खुल पाईं") }
-                    9 -> about()
+                    8 -> about()
                 }
             }
             .setNegativeButton("बंद करें", null)
@@ -1675,35 +1533,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        const val TURN_DP = 24
-
-        /**
-         * Watches the page's own scroll boxes (not the page itself). Passive listeners, work done
-         * at most once per animation frame, and the bridge is called only when the direction turns
-         * (after 24 css px one way) or the box reaches / leaves its top. Ignores scroll caused by a
-         * window resize (our toolbar) for 350 ms.
-         */
-        val SCROLL_JS = """
-(function(){if(window.__dishaSc||!window.DishaScroll)return;window.__dishaSc=1;
-var B=window.DishaScroll,last=new WeakMap(),acc=0,sentDir=0,sentTop=true,pend=null,raf=0,quiet=0;
-function now(){return Date.now()}
-function big(t){return t&&t.nodeType===1&&t!==document.documentElement&&t!==document.body&&t.clientHeight>=window.innerHeight*0.5}
-window.addEventListener('resize',function(){quiet=now()+350;acc=0;},{passive:true});
-document.addEventListener('scroll',function(e){var t=e.target;if(!big(t))return;
-var y=t.scrollTop,p=last.has(t)?last.get(t):y;last.set(t,y);pend=t;
-if(now()<quiet){acc=0;return}var d=y-p;if(!d)return;
-if((d>0)!==(acc>0))acc=0;acc+=d;
-if(!raf)raf=requestAnimationFrame(flush);},{capture:true,passive:true});
-function flush(){raf=0;var t=pend;if(!t)return;var top=t.scrollTop<=0;
-if(top!==sentTop){sentTop=top;try{B.top(top)}catch(x){}}
-if(acc>=24&&sentDir!==1){sentDir=1;acc=0;try{B.dir(1)}catch(x){}}
-else if(acc<=-24&&sentDir!==-1){sentDir=-1;acc=0;try{B.dir(-1)}catch(x){}}}
-document.addEventListener('touchstart',function(e){var n=e.target,top=true;
-while(n&&n.nodeType===1&&n!==document.documentElement&&n!==document.body){
-if(n.scrollTop>0&&n.scrollHeight>n.clientHeight){top=false;break}n=n.parentNode}
-sentDir=0;if(top!==sentTop){sentTop=top;try{B.top(top)}catch(x){}}},{capture:true,passive:true});
-})();
-"""
         const val DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     }
 }

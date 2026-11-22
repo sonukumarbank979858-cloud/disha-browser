@@ -35,11 +35,6 @@ class Prefs(ctx: Context) {
         get() = p.getInt("night", 0)
         set(v) { p.edit().putInt("night", v).apply() }
 
-    /** Chrome-style hide-on-scroll toolbar (can be switched off in Settings). */
-    var hideToolbar: Boolean
-        get() = p.getBoolean("hide_toolbar", true)
-        set(v) { p.edit().putBoolean("hide_toolbar", v).apply() }
-
     var textZoom: Int
         get() = p.getInt("zoom", 100)
         set(v) { p.edit().putInt("zoom", v).apply() }
