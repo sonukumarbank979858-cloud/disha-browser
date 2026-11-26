@@ -27,6 +27,10 @@ class Prefs(ctx: Context) {
         get() = p.getBoolean("adblock", true)
         set(v) { p.edit().putBoolean("adblock", v).apply() }
 
+    var fakeLoc: Boolean
+        get() = p.getBoolean("fake_loc", false)
+        set(v) { p.edit().putBoolean("fake_loc", v).apply() }
+
     var notifications: Boolean
         get() = p.getBoolean("notify", true)
         set(v) { p.edit().putBoolean("notify", v).apply() }

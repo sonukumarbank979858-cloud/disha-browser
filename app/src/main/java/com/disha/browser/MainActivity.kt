@@ -78,6 +78,7 @@ import android.util.TypedValue
 import androidx.core.widget.doAfterTextChanged
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
+import androidx.webkit.WebViewCompat
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.URLEncoder
@@ -528,6 +529,10 @@ class MainActivity : AppCompatActivity() {
             WebSettingsCompat.setAlgorithmicDarkeningAllowed(w.settings, true)
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+        w.addJavascriptInterface(LocBridge(), "DishaLoc")
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            try { WebViewCompat.addDocumentStartJavaScript(w, LOC_JS, setOf("*")) } catch (e: Exception) {}
+        }
         w.webViewClient = Client()
         w.webChromeClient = Chrome()
         w.setDownloadListener { url, ua, cd, mime, _ -> download(url, ua, cd, mime) }
@@ -535,6 +540,12 @@ class MainActivity : AppCompatActivity() {
             findCount.text = if (count == 0) "0/0" else "${active + 1}/$count"
         }
         return w
+    }
+
+    // 📍 टेस्ट लोकेशन: सिर्फ़ इस ब्राउज़र के वेब पेजों को बेगूसराय शहर (केंद्र) की लोकेशन दिखती है।
+    // यह VPN नहीं है: IP पता और फ़ोन की असली GPS नहीं बदलते।
+    inner class LocBridge {
+        @android.webkit.JavascriptInterface fun on(): Boolean = prefs.fakeLoc
     }
 
     private fun ensureWeb(t: Tab): WebView {
@@ -1387,7 +1398,8 @@ class MainActivity : AppCompatActivity() {
             "थीम: ${themes[prefs.night]}",
             "टेक्स्ट साइज़: ${prefs.textZoom}%",
             "दिशा को डिफ़ॉल्ट ब्राउज़र बनाएँ",
-            "ऐप के बारे में"
+            "ऐप के बारे में",
+            "📍 टेस्ट लोकेशन (बेगूसराय शहर): ${onOff(prefs.fakeLoc)}"
         )
         AlertDialog.Builder(this)
             .setTitle("सेटिंग्स")
@@ -1434,6 +1446,12 @@ class MainActivity : AppCompatActivity() {
                         startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
                     } catch (e: Exception) { toast("सेटिंग्स नहीं खुल पाईं") }
                     8 -> about()
+                    9 -> {
+                        prefs.fakeLoc = !prefs.fakeLoc
+                        toast(if (prefs.fakeLoc) "बेगूसराय लोकेशन चालू, पेज रीफ़्रेश हो रहा है" else "असली लोकेशन चालू")
+                        current?.web?.reload()
+                        showSettings()
+                    }
                 }
             }
             .setNegativeButton("बंद करें", null)
@@ -1536,3 +1554,11 @@ class MainActivity : AppCompatActivity() {
         const val DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     }
 }
+
+// Begusarai city centre (approx), used only when 📍 टेस्ट लोकेशन is on.
+const val LOC_JS = """(function(){try{if(!window.DishaLoc||!DishaLoc.on()||!navigator.geolocation)return;
+var P={coords:{latitude:25.4182,longitude:86.1272,accuracy:1000,altitude:null,altitudeAccuracy:null,heading:null,speed:null},timestamp:Date.now()};
+var g=navigator.geolocation;
+g.getCurrentPosition=function(ok){P.timestamp=Date.now();setTimeout(function(){ok&&ok(P)},50)};
+g.watchPosition=function(ok){P.timestamp=Date.now();setTimeout(function(){ok&&ok(P)},50);return 1};
+g.clearWatch=function(){};}catch(e){}})();"""
